@@ -24,6 +24,7 @@ import (
 	"mailme/internal/auth"
 	"mailme/internal/bridge"
 	"mailme/internal/gmail"
+	"mailme/internal/gws"
 	"mailme/internal/localtls"
 )
 
@@ -50,6 +51,8 @@ func run() error {
 	dir := f.String("data-dir", defaultDir(), "Private configuration and mail cache directory")
 	credentials := f.String("credentials", "", "Downloaded Google Desktop OAuth client JSON (login)")
 	email := f.String("email", "", "Your Gmail/Workspace email (login)")
+	backend := f.String("backend", "oauth", "Gmail backend: gws or oauth (login; saved for serve)")
+	gwsPath := f.String("gws-path", "gws", "Installed gws executable (login --backend gws)")
 	imapAddr := f.String("imap", "127.0.0.1:1993", "Loopback IMAP TLS listener")
 	smtpAddr := f.String("smtp", "127.0.0.1:1465", "Loopback SMTP TLS listener")
 	interval := f.Duration("sync-interval", 30*time.Second, "Gmail history polling interval (minimum 10s)")
@@ -67,8 +70,8 @@ func run() error {
 	defer cancel()
 	switch command {
 	case "login":
-		if *credentials == "" || *email == "" {
-			return fmt.Errorf("usage: mailme login --credentials /path/client.json --email you@company.com")
+		if *email == "" {
+			return fmt.Errorf("login requires --email you@company.com and either --backend gws or --credentials /path/client.json")
 		}
 		a, err := mail.ParseAddress(*email)
 		if err != nil || a.Address != *email {
@@ -77,31 +80,22 @@ func run() error {
 		if old, err := auth.Load(*dir); err == nil && !strings.EqualFold(old.Email, *email) {
 			return fmt.Errorf("directory belongs to another account; choose a separate --data-dir")
 		}
-		c, err := auth.FromCredentials(*credentials, *email)
-		if err != nil {
-			return err
-		}
-		loginCtx, stop := context.WithTimeout(ctx, 5*time.Minute)
-		defer stop()
-		token, err := auth.Authorize(loginCtx, c, func(url string) {
-			fmt.Printf("Authorize this Gmail API app in your browser:\n%s\n", url)
-			if runtime.GOOS == "darwin" {
-				_ = exec.Command("open", url).Run()
+		var c auth.Config
+		switch *backend {
+		case "gws":
+			if *credentials != "" {
+				return fmt.Errorf("--credentials is for --backend oauth; gws manages its own credentials")
 			}
-		})
+			c, err = connectGWS(ctx, *gwsPath, *email)
+		case "oauth":
+			if *credentials == "" {
+				return fmt.Errorf("OAuth login requires --credentials /path/client.json; use --backend gws for the installed CLI")
+			}
+			c, err = connectOAuth(ctx, *credentials, *email)
+		default:
+			return fmt.Errorf("unknown backend %q; choose gws or oauth", *backend)
+		}
 		if err != nil {
-			return err
-		}
-		client := c.OAuth().Client(context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Timeout: 30 * time.Second}), token)
-		client.Timeout = 30 * time.Second
-		profile, err := (&gmail.Client{HTTP: client}).Profile(ctx)
-		if err != nil {
-			return err
-		}
-		if !strings.EqualFold(profile.Email, c.Email) {
-			return fmt.Errorf("authorized account does not match --email; nothing saved")
-		}
-		if err = auth.SaveToken(c.Email, token); err != nil {
 			return err
 		}
 		if _, err = auth.EnsurePassword(c.Email); err != nil {
@@ -113,7 +107,7 @@ func run() error {
 		if err = auth.Save(*dir, c); err != nil {
 			return err
 		}
-		fmt.Println("Gmail API connected. Run `mailme settings` for Apple Mail setup, then `mailme serve`.")
+		fmt.Printf("Gmail API connected using %s. Run `mailme settings` for Apple Mail setup, then `mailme serve`.\n", c.BackendName())
 		return nil
 	case "settings":
 		c, err := auth.Load(*dir)
@@ -123,6 +117,10 @@ func run() error {
 		password, err := auth.Password(c.Email)
 		if err != nil {
 			return err
+		}
+		fmt.Printf("Gmail backend: %s\n", c.BackendName())
+		if c.BackendName() == "gws" {
+			fmt.Printf("gws executable: %s\n", c.GWSPath)
 		}
 		fmt.Printf("Apple Mail: Other Mail Account (IMAP)\nEmail / username: %s\nLocal bridge password: %s\nIncoming server: %s (TLS)\nOutgoing server: %s (TLS, Password authentication)\nCertificate to trust: %s\nDrafts and client-saved Sent: On My Mac\nDisable automatic connection settings; select the ports shown above.\n", c.Email, password, *imapAddr, *smtpAddr, filepath.Join(*dir, "localhost.crt"))
 		return nil
@@ -134,7 +132,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("run login first: %w", err)
 		}
-		httpClient, err := auth.Client(ctx, c)
+		api, err := newAPI(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -142,7 +140,6 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		api := &gmail.Client{HTTP: httpClient}
 		b, err := bridge.Open(*dir, c.Email, password, api)
 		if err != nil {
 			return err
@@ -193,18 +190,78 @@ func run() error {
 		return fmt.Errorf("unknown command %q; run mailme help", command)
 	}
 }
+
+func connectGWS(ctx context.Context, path, email string) (auth.Config, error) {
+	c := auth.Config{Email: strings.ToLower(email), Backend: "gws"}
+	api, err := gws.New(path, c.Email)
+	if err != nil {
+		return auth.Config{}, err
+	}
+	if _, err = api.Profile(ctx); err != nil {
+		return auth.Config{}, fmt.Errorf("gws account check failed (authenticate the CLI for this account with Gmail modify access): %w", err)
+	}
+	c.GWSPath = api.Path()
+	return c, nil
+}
+
+func connectOAuth(ctx context.Context, credentials, email string) (auth.Config, error) {
+	c, err := auth.FromCredentials(credentials, email)
+	if err != nil {
+		return c, err
+	}
+	loginCtx, stop := context.WithTimeout(ctx, 5*time.Minute)
+	defer stop()
+	token, err := auth.Authorize(loginCtx, c, func(url string) {
+		fmt.Printf("Authorize this Gmail API app in your browser:\n%s\n", url)
+		if runtime.GOOS == "darwin" {
+			_ = exec.Command("open", url).Run()
+		}
+	})
+	if err != nil {
+		return c, err
+	}
+	client := c.OAuth().Client(context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Timeout: 30 * time.Second}), token)
+	client.Timeout = 30 * time.Second
+	profile, err := (&gmail.Client{HTTP: client}).Profile(ctx)
+	if err != nil {
+		return c, err
+	}
+	if !strings.EqualFold(profile.Email, c.Email) {
+		return c, fmt.Errorf("authorized account does not match --email; nothing saved")
+	}
+	return c, auth.SaveToken(c.Email, token)
+}
+
+func newAPI(ctx context.Context, c auth.Config) (bridge.API, error) {
+	switch c.BackendName() {
+	case "gws":
+		return gws.New(c.GWSPath, c.Email)
+	case "oauth":
+		httpClient, err := auth.Client(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		return &gmail.Client{HTTP: httpClient}, nil
+	default:
+		return nil, fmt.Errorf("unknown saved backend %q; run login with --backend gws or --backend oauth", c.Backend)
+	}
+}
+
 func usage() {
 	fmt.Println(`Mailme — local Apple Mail ↔ Gmail API bridge
 
 Commands:
-  login     Connect a Google Desktop OAuth app; store credentials in Keychain
+  login     Connect an authenticated gws CLI or a Google Desktop OAuth app
   settings  Show Apple Mail ports, certificate path, and local bridge password
   serve     Synchronize Gmail and serve IMAP + SMTP over TLS on loopback
 
 Start:
-  mailme login --credentials /path/client.json --email you@company.com
+  mailme login --backend gws --email you@company.com
   mailme settings
   mailme serve
+
+Or use a Desktop OAuth app:
+  mailme login --credentials /path/client.json --email you@company.com
 
 Use -h after a command for flags. The bridge never connects to Gmail IMAP/SMTP.`)
 }

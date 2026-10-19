@@ -2,7 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Replace every /ABSOLUTE/PATH placeholder before installing.
      launchd does not expand ~ or environment variables in these strings.
-     Create the log directory first. This template is not installed automatically. -->
+     Create the log directory first. This template is not installed automatically.
+     For gws: login saves an absolute executable path. A wrapper may still need
+     its runtime on PATH; add EnvironmentVariables if needed. Reproduce any
+     custom gws authentication/config environment used by your interactive shell. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.mailme.bridge</string>

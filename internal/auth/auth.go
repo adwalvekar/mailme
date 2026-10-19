@@ -25,8 +25,18 @@ const service = "mailme.gmail-api-bridge"
 
 type Config struct {
 	Email        string `json:"email"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
+	Backend      string `json:"backend,omitempty"`
+	GWSPath      string `json:"gws_path,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+}
+
+// BackendName preserves configurations created before backend selection existed.
+func (c Config) BackendName() string {
+	if c.Backend == "" {
+		return "oauth"
+	}
+	return c.Backend
 }
 
 func (c Config) OAuth() *oauth2.Config {

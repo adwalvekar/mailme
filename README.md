@@ -1,6 +1,6 @@
 # Mailme
 
-A local Gmail API bridge for Apple Mail, written in Go. Apple Mail talks IMAP and SMTP **only to your Mac**. Mailme talks to Google using OAuth and the Gmail REST API over HTTPS. It never connects to Google's IMAP or SMTP servers.
+A local Gmail API bridge for Apple Mail, written in Go. Apple Mail talks IMAP and SMTP **only to your Mac**. Mailme talks to Google through the installed Google Workspace CLI (`gws`), or directly with Desktop OAuth, using the Gmail REST API over HTTPS. It never connects to Google's IMAP or SMTP servers.
 
 This is an initial, tested implementation for one account. Protocol integration tests use a fake Gmail service; a live Workspace account and Apple Mail have **not** yet been tested together.
 
@@ -8,8 +8,10 @@ This is an initial, tested implementation for one account. Protocol integration 
 flowchart LR
     Mail[Apple Mail] <-->|IMAP over TLS · 127.0.0.1:1993| Bridge[Mailme on your Mac]
     Mail -->|SMTP over TLS · 127.0.0.1:1465| Bridge
-    Bridge <-->|Gmail API · HTTPS + OAuth| Gmail[Gmail]
-    Bridge --- Keychain[macOS Keychain: OAuth + bridge password]
+    Bridge <-->|Selected backend| GWS[Installed gws CLI]
+    GWS <-->|Gmail API · HTTPS| Gmail[Gmail]
+    Bridge <-->|Optional direct OAuth backend · HTTPS| Gmail
+    Bridge --- Keychain[macOS Keychain: bridge password]
     Bridge --- Cache[Private local mail cache]
 ```
 
@@ -17,7 +19,8 @@ SMTP handles sending; IMAP is also needed to read mail, discover folders, and sy
 
 ## What works
 
-- Desktop OAuth with PKCE, state validation, and an ephemeral loopback callback. Tokens and a random local bridge password are stored in macOS Keychain.
+- An installed, authenticated `gws` CLI can provide all Gmail access using its existing credentials and token refresh. No additional OAuth app is needed in this mode. The local bridge password is stored separately in macOS Keychain.
+- Optional direct Desktop OAuth with PKCE, state validation, and an ephemeral loopback callback; this backend also stores its Google tokens in macOS Keychain.
 - Authenticated IMAP and SMTP over TLS, bound to numeric loopback addresses only. A unique localhost certificate is generated at login.
 - Inbox, Sent, All Mail, Trash, Junk, Starred, and custom Gmail labels. User labels appear beneath `Labels/`.
 - MIME message bodies, attachments, partial IMAP fetches, envelope/body structure, and searches including decoded text.
@@ -26,7 +29,24 @@ SMTP handles sending; IMAP is also needed to read mail, discover folders, and sy
 - Full metadata sync on first run, then history-based sync every 30 seconds. Expired Gmail history triggers a full reconciliation. Failed syncs do not advance the saved cursor.
 - SMTP envelope recipients mapped to Gmail's header-based recipient model, including Bcc. MIME bodies are preserved.
 
-## Set up Google access
+## Build and connect with gws
+
+Requires macOS, Go 1.24 or later, access to your login Keychain, and an installed [Google Workspace CLI](https://github.com/googleworkspace/cli). This setup assumes `gws` is already authenticated for your work account using your organization's approved app.
+
+```sh
+go build -o bin/mailme ./cmd/mailme
+./bin/mailme login --backend gws --email you@company.com
+./bin/mailme settings
+./bin/mailme serve
+```
+
+`login --backend gws` checks your Gmail profile through the CLI, saves the selected backend and absolute executable path, and creates the local bridge password and TLS identity. It does not install `gws`, open an OAuth consent page, export CLI tokens, or send email. To select a particular installation, add `--gws-path /absolute/path/to/gws` to `login`. `serve` uses the saved backend; it does not fall back to direct OAuth.
+
+The CLI's existing authorization needs `https://www.googleapis.com/auth/gmail.modify` (or equivalent Gmail permissions for all operations), covering reading, sending, changing labels, and Trash. Approval of the app alone does not grant these permissions. The login profile check verifies the account and read access; it does **not** exercise sending or modification permissions. Resolve missing access through your organization's approved `gws` authentication process. Mailme does not change CLI credentials or request new CLI scopes. See [Google's scope reference](https://developers.google.com/workspace/gmail/api/auth/scopes).
+
+Every CLI request specifies your configured email as `userId`, so changing the CLI's active account causes requests to fail rather than silently switching mailboxes. Mailme inherits the CLI's normal environment and credential configuration. Run the bridge as the same macOS user that authenticated `gws`.
+
+## Alternative: direct Desktop OAuth
 
 Use your organization's approved Google Cloud project and OAuth client:
 
@@ -37,18 +57,19 @@ Use your organization's approved Google Cloud project and OAuth client:
 
 Keep the downloaded credentials outside the repository. Desktop OAuth uses a loopback redirect supported by [Google's native app flow](https://developers.google.com/identity/protocols/oauth2/native-app).
 
-## Build and connect
-
-Requires macOS, Go 1.24 or later, and access to your login Keychain.
-
 ```sh
-go build -o bin/mailme ./cmd/mailme
-./bin/mailme login --credentials /absolute/path/client.json --email you@company.com
+./bin/mailme login --backend oauth --credentials /absolute/path/client.json --email you@company.com
 ./bin/mailme settings
 ./bin/mailme serve
 ```
 
-The login command opens Google's consent page and checks that the authorized account matches `--email`. It does not send email. `settings` deliberately prints the **local bridge password** for entering into Apple Mail; do not share that output. Your Google password is never given to the bridge or Apple Mail.
+OAuth login opens Google's consent page and checks that the authorized account matches `--email`. It does not send email. `--backend oauth` is the default when omitted, so existing login commands and saved configurations continue working.
+
+To switch an existing account to `gws`, stop the bridge, run `login --backend gws --email ...` with the same data directory, then restart. This retains the mail cache, TLS identity, and local password. Old direct OAuth tokens remain in Keychain but are unused by the `gws` backend.
+
+## Run the bridge
+
+`settings` deliberately prints the **local bridge password** for entering into Apple Mail; do not share that output. Your Google password is never given to the bridge or Apple Mail.
 
 The default data directory on macOS is `~/Library/Application Support/mailme`. To change it, pass the same `--data-dir /absolute/path` to every command. Custom ports are configured with `serve --imap 127.0.0.1:1993 --smtp 127.0.0.1:1465`; pass those flags to `settings` as well to display them. Only one process may open a data directory.
 
@@ -104,16 +125,19 @@ Gmail labels are views of the same message, so an IMAP copy does not duplicate t
 
 ## Storage and operational details
 
-- `config.json`: account and OAuth client configuration, mode `0600`.
+- `config.json`: account, selected backend, and either the absolute `gws` path or Desktop OAuth client configuration, mode `0600`. Missing `backend` means `oauth` for compatibility.
 - `mail.db`: bbolt database with metadata, persistent UIDs, local flags, subscriptions, and downloaded MIME bodies, mode `0600`.
 - `localhost.crt` / `localhost.key`: local TLS identity, valid for one year. To renew, stop the bridge, move both files aside, rerun login, and trust the new certificate.
-- Keychain service `mailme.gmail-api-bridge`: `<email>:oauth` and `<email>:bridge` entries.
+- Keychain service `mailme.gmail-api-bridge`: `<email>:bridge`, plus `<email>:oauth` when direct OAuth has been used. `gws` owns its own Google credential storage.
+- With `gws`, outgoing MIME is passed through `--upload` as a `0600` file inside a temporary `0700` directory. It is removed on success, failure, and cancellation. An abrupt process kill or machine crash can leave this temporary data behind. Message bodies are never passed in CLI arguments.
 
 The cache is **not encrypted by the application**. Protect it using the Mac's normal disk encryption and access controls, and treat backups as mail data. The program does not log message bodies, passwords, or OAuth tokens. Raw protocol tracing is disabled. Deleting the cache changes IMAP identities and causes Mail to resynchronize; stop the bridge before manipulating it.
 
-Gmail requests are paced. Read-only requests retry transient server/rate-limit errors with backoff. Writes are not automatically retried. If a send fails after Google may have accepted it, Mail receives an error asking you to check Gmail Sent before retrying. Exactly-once delivery cannot be guaranteed across an interrupted API response or a disconnected local SMTP client.
+Gmail requests are paced. Read-only requests retry transient server/rate-limit errors with backoff. Mailme never automatically retries a write or reinvokes a failed `gws` send. If a send fails after Google may have accepted it, Mail receives an error asking you to check Gmail Sent before retrying. Exactly-once delivery cannot be guaranteed across an interrupted API response or a disconnected local SMTP client.
 
-If Google blocks authorization, use the organization's app approval process. If refresh authorization expires or is revoked, rerun `login`. External apps left in Google's Testing state can have short-lived refresh tokens; see [Google's token expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+The `gws` backend uses the raw Discovery commands (`gmail users getProfile`, `labels list`, `messages list/get/modify/trash/untrash/send`, and `history list`) with `--params` and `--format json`. Sending requires `--upload` and `--upload-content-type message/rfc822`. Pagination is managed by Mailme, without the CLI's `--page-all` page limit. Commands have a one-minute deadline, bounded output, and suppressed stderr; only sanitized errors are reported. CLI command syntax was checked against [this upstream revision](https://github.com/googleworkspace/cli/tree/a3768d0e82ad83cca2da97724e46bea4ff0e6dbd). `gws` evolves independently; validate your organization's installed version with the checklist below.
+
+If Google blocks authorization, use the organization's app approval process. If refresh authorization expires or is revoked, reauthenticate `gws` for the CLI backend, or rerun Mailme's OAuth `login` for the direct backend. External apps left in Google's Testing state can have short-lived refresh tokens; see [Google's token expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
 
 ## Current limits
 
@@ -122,6 +146,7 @@ If Google blocks authorization, use the organization's app approval process. If 
 - No offline write queue. Existing cached bodies remain readable during a subsequent sync failure, but startup requires a successful sync.
 - A simple in-memory metadata index is persisted transactionally. Operations and sync are serialized to preserve ordering, so a long initial sync or text search can delay other IMAP commands. This has not been load-tested against a very large mailbox.
 - Gmail changes appear on the polling interval, plus API processing time. No Cloud Pub/Sub setup is required.
+- The `gws` backend starts one subprocess per request. Large initial syncs and uncached searches can be slower than direct OAuth.
 - The IMAP dependency is pinned to a v2 beta. Automated protocol coverage does not establish full Apple Mail compatibility; finish the manual checklist below before relying on this for daily work.
 
 ## Validation
@@ -132,7 +157,7 @@ go vet ./...
 go build -o bin/mailme ./cmd/mailme
 ```
 
-Tests use synthetic messages and temporary local TLS/HTTP listeners. They do not access Keychain secrets, authenticate to Google, or send real email. They cover OAuth state/PKCE, TLS identity and loopback restrictions, Gmail pagination/retries, sync recovery, UID persistence, MIME/attachments, decoded search, deletion semantics, concurrent IMAP views, IDLE, SMTP authentication, and Bcc preservation.
+Tests use synthetic messages, a simulated CLI, a mock Keychain, and temporary local TLS/HTTP listeners. They do not require `gws` to be installed, access real Keychain secrets, authenticate to Google, or send real email. They cover OAuth state/PKCE, TLS identity and loopback restrictions, Gmail pagination/retries, sync recovery, UID persistence, MIME/attachments, decoded search, deletion semantics, concurrent IMAP views, IDLE, SMTP authentication, and Bcc preservation. CLI tests also cover saved backend selection, account matching, more than ten pages of results, large MIME uploads and private file cleanup, failed-send non-retry, malformed/oversized output, HTTP error preservation, and process cancellation.
 
 For the first live setup, verify:
 
@@ -144,6 +169,8 @@ For the first live setup, verify:
 6. Drafts save locally, and Mail does not try to APPEND to the bridge's Sent folder.
 
 For background use, `contrib/com.mailme.bridge.plist.example` is a launchd template. Replace its absolute-path placeholders and install it as a per-user LaunchAgent after live validation; run it as your logged-in user so it can access your login Keychain.
+
+For `gws`, the saved absolute path avoids depending on launchd's limited `PATH`. If the executable is a wrapper that needs another runtime, include that runtime's directory in the LaunchAgent's `EnvironmentVariables` → `PATH`. If your CLI authentication uses environment variables or a custom configuration directory, configure the same environment for the LaunchAgent; an interactive shell's environment is not automatically inherited. A CLI installation moved to a new path requires rerunning `login --backend gws --gws-path ...`.
 
 The API synchronization and send semantics follow [Google's synchronization guide](https://developers.google.com/workspace/gmail/api/guides/sync) and [messages.send reference](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send).
 

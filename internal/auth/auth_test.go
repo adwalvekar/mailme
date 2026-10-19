@@ -53,3 +53,27 @@ func TestCredentialsRequireDesktopApp(t *testing.T) {
 		t.Fatalf("credentials: %v %v", c, err)
 	}
 }
+
+func TestBackendConfigCompatibility(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"email":"me@example.com","client_id":"old-client","client_secret":"secret"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(dir)
+	if err != nil || c.BackendName() != "oauth" || c.ClientID != "old-client" {
+		t.Fatalf("legacy config: %+v %v", c, err)
+	}
+	c = Config{Email: c.Email, Backend: "gws", GWSPath: "/opt/homebrew/bin/gws"}
+	if err := Save(dir, c); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil || loaded != c {
+		t.Fatalf("gws config: %+v %v", loaded, err)
+	}
+	stat, err := os.Stat(path)
+	if err != nil || stat.Mode().Perm() != 0600 {
+		t.Fatalf("config permissions: %v %v", stat, err)
+	}
+}
