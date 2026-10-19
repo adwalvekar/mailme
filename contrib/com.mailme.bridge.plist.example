@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Replace every /ABSOLUTE/PATH placeholder before installing.
+     launchd does not expand ~ or environment variables in these strings.
+     Create the log directory first. This template is not installed automatically. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mailme.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/mailme/bin/mailme</string>
+    <string>serve</string>
+    <string>--data-dir</string>
+    <string>/ABSOLUTE/PATH/Library/Application Support/mailme</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme.log</string>
+</dict>
+</plist>

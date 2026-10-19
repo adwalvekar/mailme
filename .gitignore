@@ -1,0 +1,8 @@
+/mailme
+/bin/
+/.local/
+credentials*.json
+client_secret*.json
+*.test
+coverage.out
+.DS_Store
