@@ -25,6 +25,7 @@ type invocation struct {
 	Raw        []byte
 	FileMode   uint32
 	ParentMode uint32
+	Started    int64
 }
 
 // Run the test binary as a fake gws. Tests exercise actual subprocess arguments,
@@ -52,7 +53,7 @@ func TestGWSHelperProcess(t *testing.T) {
 	}
 	path := os.Getenv("MAILME_TEST_LOG")
 	previous, _ := os.ReadFile(path)
-	entry := invocation{Args: args, Upload: flag("--upload")}
+	entry := invocation{Args: args, Upload: flag("--upload"), Started: time.Now().UnixNano()}
 	if entry.Upload != "" {
 		entry.Raw, _ = os.ReadFile(entry.Upload)
 		if stat, err := os.Stat(entry.Upload); err == nil {
@@ -74,7 +75,26 @@ func TestGWSHelperProcess(t *testing.T) {
 		os.Exit(code)
 	}
 	scenario := os.Getenv("MAILME_TEST_SCENARIO")
+	if scenario == "concurrent" || scenario == "auth-recover" {
+		ready := path + ".ready"
+		_, statErr := os.Stat(ready)
+		if scenario == "auth-recover" && args[2] == "getProfile" {
+			os.WriteFile(ready, []byte("ready"), 0600)
+		}
+		delay := 250
+		if v, err := strconv.Atoi(os.Getenv("MAILME_TEST_DELAY_MS")); err == nil {
+			delay = v
+		}
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		if scenario == "auth-recover" && args[2] != "getProfile" && os.IsNotExist(statErr) {
+			emit(`{"error":{"code":401,"reason":"authError"}}`, 1)
+		}
+	}
 	switch scenario {
+	case "rate-limit":
+		if len(previous) == 0 {
+			emit(`{"error":{"code":403,"status":"RESOURCE_EXHAUSTED","errors":[{"reason":"userRateLimitExceeded"}],"message":"PRIVATE TOKEN"}}`, 1)
+		}
 	case "slow":
 		time.Sleep(10 * time.Minute)
 	case "oversize":
@@ -145,8 +165,14 @@ func TestGWSHelperProcess(t *testing.T) {
 		}
 		emit(`{"history":[{"messages":[{"id":"a"},{"id":"b"}]}],"historyId":"130"}`, 0)
 	case "messages/get", "messages/modify", "messages/trash", "messages/untrash":
-		if args[3] == "get" && params["format"] != "raw" {
-			os.Exit(3)
+		if args[3] == "get" {
+			if params["format"] == "metadata" {
+				if params["fields"] != gmail.MetadataFields || len(params["metadataHeaders"].([]any)) < 11 {
+					os.Exit(3)
+				}
+			} else if params["format"] != "raw" {
+				os.Exit(3)
+			}
 		}
 		if args[3] == "modify" {
 			var body map[string]any
@@ -190,6 +216,9 @@ func fakeCLI(t *testing.T, scenario string) (*Client, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Most command contract tests start with an already-warmed credential cache.
+	// Dedicated concurrency tests exercise startup and 401 recovery probes.
+	c.authReady = true
 	return c, logPath
 }
 
@@ -293,7 +322,11 @@ func TestGWSReadRetryAndErrorHandling(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			c, logPath := fakeCLI(t, scenario)
 			_, err := c.Profile(context.Background())
-			if err == nil || strings.Contains(err.Error(), "PRIVATE") || len(calls(t, logPath)) != 1 {
+			want := 1
+			if scenario == "error-zero-exit" {
+				want = 2
+			}
+			if err == nil || strings.Contains(err.Error(), "PRIVATE") || len(calls(t, logPath)) != want {
 				t.Fatalf("invalid response accepted, retried, or leaked: %v", err)
 			}
 		})
@@ -315,6 +348,7 @@ func TestGWSReadRetryAndErrorHandling(t *testing.T) {
 
 func TestGWSCancellationCleansUploadAndQueuedCalls(t *testing.T) {
 	c, logPath := fakeCLI(t, "slow")
+	c.gate = make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)

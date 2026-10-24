@@ -6,11 +6,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,7 +22,21 @@ type Message struct {
 	LabelIDs     []string `json:"labelIds"`
 	InternalDate string   `json:"internalDate"`
 	Raw          string   `json:"raw,omitempty"`
+	ThreadID     string   `json:"threadId,omitempty"`
+	Payload      *Payload `json:"payload,omitempty"`
 }
+type Header struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+type Payload struct {
+	Headers []Header `json:"headers"`
+}
+
+var MetadataHeaders = []string{"From", "To", "Cc", "Bcc", "Reply-To", "Sender", "Subject", "Date", "Message-ID", "In-Reply-To", "References"}
+
+const MetadataFields = "id,labelIds,internalDate,threadId,payload/headers"
+
 type Label struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -32,22 +46,27 @@ type Profile struct {
 	Email     string `json:"emailAddress"`
 	HistoryID string `json:"historyId"`
 }
-type APIError struct{ Status int }
-
-func (e *APIError) Error() string { return fmt.Sprintf("Gmail API returned HTTP %d", e.Status) }
-
 type Client struct {
 	HTTP    *http.Client
 	BaseURL string // Override only in tests.
-	mu      sync.Mutex
-	next    time.Time
+	Email   string
+	writeMu sync.Mutex
+	pace    Pacer
 }
 
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
 	base := c.BaseURL
 	if base == "" {
 		base = Endpoint
+		if c.Email != "" {
+			base = "https://gmail.googleapis.com/gmail/v1/users/" + url.PathEscape(c.Email)
+		}
 	}
+	if method != http.MethodGet {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+	}
+	apiMethod, id := requestIdentity(path)
 	var body []byte
 	var err error
 	if in != nil {
@@ -59,14 +78,7 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	// Pace requests below Gmail's per-user quota. Only GET requests are retried;
 	// an ambiguous send outcome must never cause an automatic duplicate send.
 	for attempt := 0; ; attempt++ {
-		c.mu.Lock()
-		when := c.next
-		if when.Before(time.Now()) {
-			when = time.Now()
-		}
-		c.next = when.Add(40 * time.Millisecond)
-		c.mu.Unlock()
-		if err := wait(ctx, time.Until(when)); err != nil {
+		if err := c.pace.Wait(ctx, Cost(apiMethod)); err != nil {
 			return err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
@@ -78,23 +90,38 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		}
 		res, err := c.HTTP.Do(req)
 		if err != nil {
-			return fmt.Errorf("Gmail API transport failed: %w", err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return errors.New("Gmail API transport failed method=" + apiMethod + " id=" + SafeIdentifier(id))
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			if out != nil {
 				err = json.NewDecoder(io.LimitReader(res.Body, 64<<20)).Decode(out)
 			}
 			res.Body.Close()
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if apiMethod == "messages.get" {
+					return &MalformedMessageError{ID: id}
+				}
+				return errors.New("invalid Gmail API response method=" + apiMethod)
+			}
 			return err
 		}
-		// Do not include Google's response body: it may contain message data.
+		data, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+		apiErr := ParseAPIError(data, res.StatusCode)
+		apiErr.Method, apiErr.ID = apiMethod, id
+		apiErr.RetryAfter = RetryDelay(res.Header.Get("Retry-After"), time.Now())
 		res.Body.Close()
-		if method != http.MethodGet || attempt >= 3 || (res.StatusCode != 429 && res.StatusCode < 500) {
-			return &APIError{Status: res.StatusCode}
+		if method != http.MethodGet || attempt >= 3 || !Retryable(apiErr) {
+			return apiErr
 		}
 		delay := time.Second << attempt
-		if secs, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && secs > 0 && secs < 60 {
-			delay = time.Duration(secs) * time.Second
+		if apiErr.RetryAfter > delay {
+			delay = apiErr.RetryAfter
 		}
 		if err := wait(ctx, delay); err != nil {
 			return err
@@ -102,6 +129,9 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	}
 }
 func wait(ctx context.Context, d time.Duration) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -110,6 +140,24 @@ func wait(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+func requestIdentity(path string) (string, string) {
+	path, _, _ = strings.Cut(path, "?")
+	p := strings.Split(strings.Trim(path, "/"), "/")
+	if p[0] == "profile" {
+		return "getProfile", ""
+	}
+	if len(p) == 1 {
+		return p[0] + ".list", ""
+	}
+	if p[1] == "send" {
+		return "messages.send", ""
+	}
+	id, _ := url.PathUnescape(p[1])
+	if len(p) == 3 {
+		return "messages." + p[2], id
+	}
+	return "messages.get", id
 }
 func (c *Client) Profile(ctx context.Context) (*Profile, error) {
 	var p Profile
@@ -124,6 +172,10 @@ func (c *Client) Labels(ctx context.Context) ([]Label, error) {
 	return r.Labels, err
 }
 func (c *Client) IDs(ctx context.Context) ([]string, error) {
+	return c.listIDs(ctx, "")
+}
+func (c *Client) InboxIDs(ctx context.Context) ([]string, error) { return c.listIDs(ctx, "INBOX") }
+func (c *Client) listIDs(ctx context.Context, label string) ([]string, error) {
 	var ids []string
 	page := ""
 	for {
@@ -131,7 +183,14 @@ func (c *Client) IDs(ctx context.Context) ([]string, error) {
 			Messages []Message `json:"messages"`
 			Next     string    `json:"nextPageToken"`
 		}
-		err := c.call(ctx, "GET", "/messages?includeSpamTrash=true&maxResults=500&pageToken="+url.QueryEscape(page), nil, &r)
+		q := url.Values{"includeSpamTrash": {"true"}, "maxResults": {"500"}, "fields": {"messages/id,nextPageToken"}}
+		if page != "" {
+			q.Set("pageToken", page)
+		}
+		if label != "" {
+			q.Set("labelIds", label)
+		}
+		err := c.call(ctx, "GET", "/messages?"+q.Encode(), nil, &r)
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +205,17 @@ func (c *Client) IDs(ctx context.Context) ([]string, error) {
 }
 func (c *Client) Message(ctx context.Context, id, format string) (*Message, error) {
 	var m Message
-	err := c.call(ctx, "GET", "/messages/"+url.PathEscape(id)+"?format="+url.QueryEscape(format), nil, &m)
+	q := url.Values{"format": {format}}
+	if format == "metadata" {
+		q.Set("fields", MetadataFields)
+		q["metadataHeaders"] = append([]string(nil), MetadataHeaders...)
+	} else if format == "raw" {
+		q.Set("fields", "id,raw")
+	}
+	err := c.call(ctx, "GET", "/messages/"+url.PathEscape(id)+"?"+q.Encode(), nil, &m)
+	if err == nil {
+		err = ValidateMessage(&m, id, format)
+	}
 	return &m, err
 }
 
@@ -198,5 +267,12 @@ func (c *Client) Untrash(ctx context.Context, id string) (*Message, error) {
 	return &m, err
 }
 func (c *Client) Send(ctx context.Context, raw []byte) error {
-	return c.call(ctx, "POST", "/messages/send", map[string]string{"raw": base64.RawURLEncoding.EncodeToString(raw)}, nil)
+	var m Message
+	if err := c.call(ctx, "POST", "/messages/send", map[string]string{"raw": base64.RawURLEncoding.EncodeToString(raw)}, &m); err != nil {
+		return err
+	}
+	if m.ID == "" {
+		return errors.New("Gmail send returned no message ID; check Gmail Sent before retrying")
+	}
+	return nil
 }

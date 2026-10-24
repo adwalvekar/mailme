@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"mailme/internal/gmail"
@@ -19,10 +20,23 @@ import (
 type Client struct {
 	path, email string
 	gate        chan struct{}
-	next        time.Time // protected by gate, including while a command is running
+	writeMu     sync.Mutex
+	pace        gmail.Pacer
+	authMu      authBarrier
+	authReady   bool
+	authEpoch   uint64
+	authErr     error
+	authRetry   time.Time
 }
 
-func New(path, email string) (*Client, error) {
+func New(path, email string, concurrency ...int) (*Client, error) {
+	n := 6
+	if len(concurrency) > 0 {
+		n = concurrency[0]
+	}
+	if n < 1 || n > 16 {
+		return nil, errors.New("gws concurrency must be between 1 and 16")
+	}
 	if email == "" {
 		return nil, errors.New("gws backend requires an account email")
 	}
@@ -37,7 +51,11 @@ func New(path, email string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{path: resolved, email: email, gate: make(chan struct{}, 1)}, nil
+	resolved, err = nativeExecutable(resolved)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{path: resolved, email: email, gate: make(chan struct{}, n)}, nil
 }
 
 func (c *Client) Path() string { return c.path }
@@ -45,7 +63,12 @@ func (c *Client) Path() string { return c.path }
 func (c *Client) call(ctx context.Context, resource, method string, params map[string]any, body any, upload string, read bool, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	// Serializing subprocesses avoids overlapping CLI credential refreshes.
+	// Bound all reads, including foreground body requests, with one shared pool.
+	// Mutations are serialized and are never re-invoked, even after a 401.
+	if !read {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+	}
 	select {
 	case c.gate <- struct{}{}:
 		defer func() { <-c.gate }()
@@ -77,17 +100,51 @@ func (c *Client) call(ctx context.Context, resource, method string, params map[s
 	if upload != "" {
 		args = append(args, "--upload", upload, "--upload-content-type", "message/rfc822")
 	}
+	methodName := method
+	if resource != "" {
+		methodName = resource + "." + method
+	}
+	id, _ := params["id"].(string)
+	epoch, err := c.ensureAuth(ctx)
+	if err != nil {
+		return err
+	}
+	authRetried := false
 	for attempt := 0; ; attempt++ {
-		if err := wait(ctx, time.Until(c.next)); err != nil {
+		if err := c.pace.Wait(ctx, gmail.Cost(methodName)); err != nil {
 			return err
 		}
-		c.next = time.Now().Add(40 * time.Millisecond)
+		if err := c.authMu.lock(ctx, false); err != nil {
+			return err
+		}
 		err := c.invoke(ctx, args, out)
+		c.authMu.unlock(false)
+		err = operationError(err, methodName, id)
 		var apiErr *gmail.APIError
-		if !read || attempt >= 3 || !errors.As(err, &apiErr) || (apiErr.Status != 429 && apiErr.Status < 500) {
+		if errors.As(err, &apiErr) && apiErr.Status == 401 {
+			if !read {
+				c.invalidateAuth(epoch)
+				return err
+			}
+			if authRetried {
+				return err
+			}
+			authRetried = true
+			original := err
+			epoch, err = c.recoverAuth(ctx, epoch)
+			if err != nil {
+				return fmt.Errorf("%w; credential probe failed: %v", original, err)
+			}
+			continue
+		}
+		if !read || attempt >= 3 || !gmail.Retryable(err) {
 			return err
 		}
-		if err := wait(ctx, time.Second<<attempt); err != nil {
+		delay := time.Second << attempt
+		if apiErr != nil && apiErr.RetryAfter > delay {
+			delay = apiErr.RetryAfter
+		}
+		if err := wait(ctx, delay); err != nil {
 			return err
 		}
 	}
@@ -133,8 +190,15 @@ func (c *Client) Labels(ctx context.Context) ([]gmail.Label, error) {
 }
 
 func (c *Client) IDs(ctx context.Context) ([]string, error) {
+	return c.listIDs(ctx, "")
+}
+func (c *Client) InboxIDs(ctx context.Context) ([]string, error) { return c.listIDs(ctx, "INBOX") }
+func (c *Client) listIDs(ctx context.Context, label string) ([]string, error) {
 	var ids []string
-	params := map[string]any{"includeSpamTrash": true, "maxResults": 500}
+	params := map[string]any{"includeSpamTrash": true, "maxResults": 500, "fields": "messages/id,nextPageToken"}
+	if label != "" {
+		params["labelIds"] = []string{label}
+	}
 	seen := make(map[string]bool)
 	for {
 		var r struct {
@@ -162,9 +226,17 @@ func (c *Client) IDs(ctx context.Context) ([]string, error) {
 }
 
 func (c *Client) Message(ctx context.Context, id, format string) (*gmail.Message, error) {
-	m, err := c.message(ctx, "get", map[string]any{"id": id, "format": format}, nil, true)
-	if err == nil && format == "raw" && m.Raw == "" {
-		return nil, errors.New("gws returned no raw MIME body")
+	params := map[string]any{"id": id, "format": format}
+	if format == "metadata" {
+		params["metadataHeaders"] = gmail.MetadataHeaders
+		params["fields"] = gmail.MetadataFields
+	}
+	if format == "raw" {
+		params["fields"] = "id,raw"
+	}
+	m, err := c.message(ctx, "get", params, nil, true)
+	if err == nil {
+		err = gmail.ValidateMessage(m, id, format)
 	}
 	return m, err
 }
@@ -216,6 +288,10 @@ func (c *Client) message(ctx context.Context, method string, params map[string]a
 		return nil, err
 	}
 	if m.ID == "" || m.ID != params["id"] {
+		if read {
+			id, _ := params["id"].(string)
+			return nil, &gmail.MalformedMessageError{ID: id}
+		}
 		return nil, fmt.Errorf("gws %s returned an unexpected message ID", method)
 	}
 	return &m, nil

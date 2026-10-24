@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,7 +81,7 @@ func TestSendNeverRetriesAndErrorsRedactBody(t *testing.T) {
 	defer s.Close()
 	c := &Client{HTTP: s.Client(), BaseURL: s.URL}
 	err := c.Send(context.Background(), []byte("test"))
-	if err == nil || err.Error() != "Gmail API returned HTTP 503" || calls.Load() != 1 {
+	if err == nil || strings.Contains(err.Error(), "PRIVATE") || calls.Load() != 1 {
 		t.Fatalf("send result: %v, calls=%d", err, calls.Load())
 	}
 }
@@ -101,7 +102,7 @@ func TestReadRetryAndCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	c.next = time.Now().Add(time.Minute)
+	c.pace.next = time.Now().Add(time.Minute)
 	if _, err = c.Profile(ctx); err != context.Canceled {
 		t.Fatalf("cancellation: %v", err)
 	}
