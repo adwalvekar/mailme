@@ -25,6 +25,7 @@ import (
 	"mailme/internal/bridge"
 	"mailme/internal/gmail"
 	"mailme/internal/gws"
+	"mailme/internal/launchagent"
 	"mailme/internal/localtls"
 )
 
@@ -53,6 +54,12 @@ func run() error {
 	email := f.String("email", "", "Your Gmail/Workspace email (login)")
 	backend := f.String("backend", "oauth", "Gmail backend: gws or oauth (login; saved for serve)")
 	gwsPath := f.String("gws-path", "gws", "Installed gws executable (login --backend gws)")
+	concurrency := f.Int("read-concurrency", 6, "Concurrent metadata reads / gws read subprocesses (1–16)")
+	quotaProfile := f.String("quota-profile", "current", "Gmail quota profile: current (conservative default) or legacy (only if verified)")
+	copyPassword := f.Bool("copy-password", false, "Copy the local password with pbcopy instead of printing it (settings)")
+	probeID := f.String("message-id", "", "Probe one Gmail message ID (read-only probe)")
+	probeStart := f.Int("start", 0, "First sorted message index (read-only probe)")
+	probeCount := f.Int("count", 100, "Maximum messages to fetch (read-only probe)")
 	imapAddr := f.String("imap", "127.0.0.1:1993", "Loopback IMAP TLS listener")
 	smtpAddr := f.String("smtp", "127.0.0.1:1465", "Loopback SMTP TLS listener")
 	interval := f.Duration("sync-interval", 30*time.Second, "Gmail history polling interval (minimum 10s)")
@@ -68,7 +75,58 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if *concurrency < 1 || *concurrency > 16 {
+		return fmt.Errorf("--read-concurrency must be between 1 and 16")
+	}
+	if !gmail.ValidQuotaProfile(*quotaProfile) {
+		return fmt.Errorf("--quota-profile must be current or legacy")
+	}
 	switch command {
+	case "install-agent", "uninstall-agent":
+		if runtime.GOOS != "darwin" {
+			return fmt.Errorf("LaunchAgents require macOS")
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		if command == "uninstall-agent" {
+			return launchagent.Uninstall(ctx, home)
+		}
+		if *interval < 10*time.Second {
+			return fmt.Errorf("--sync-interval must be at least 10s")
+		}
+		if _, err := auth.Load(*dir); err != nil {
+			return fmt.Errorf("run login first: %w", err)
+		}
+		binary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		dataDir, err := filepath.Abs(*dir)
+		if err != nil {
+			return err
+		}
+		path, err := launchagent.Install(ctx, home, binary, dataDir, *imapAddr, *smtpAddr, interval.String(), *quotaProfile, *concurrency)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Installed %s\nLogs: %s\n", path, filepath.Join(home, "Library", "Logs", "mailme", "bridge.log"))
+		return nil
+	case "probe":
+		if *probeStart < 0 || *probeCount < 1 {
+			return fmt.Errorf("probe requires --start >= 0 and --count >= 1")
+		}
+		c, err := auth.Load(*dir)
+		if err != nil {
+			return err
+		}
+		api, err := newAPI(ctx, c, *concurrency, *quotaProfile)
+		if err != nil {
+			return err
+		}
+		log.Printf("Read-only probe quota profile: %s", *quotaProfile)
+		return probe(ctx, api, *probeID, *probeStart, *probeCount, *concurrency)
 	case "login":
 		if *email == "" {
 			return fmt.Errorf("login requires --email you@company.com and either --backend gws or --credentials /path/client.json")
@@ -107,7 +165,7 @@ func run() error {
 		if err = auth.Save(*dir, c); err != nil {
 			return err
 		}
-		fmt.Printf("Gmail API connected using %s. Run `mailme settings` for Apple Mail setup, then `mailme serve`.\n", c.BackendName())
+		fmt.Printf("Gmail API connected using %s. Run `mailme settings --copy-password` for Apple Mail setup, then `mailme serve`.\n", c.BackendName())
 		return nil
 	case "settings":
 		c, err := auth.Load(*dir)
@@ -117,6 +175,14 @@ func run() error {
 		password, err := auth.Password(c.Email)
 		if err != nil {
 			return err
+		}
+		if *copyPassword {
+			cmd := exec.CommandContext(ctx, "pbcopy")
+			cmd.Stdin = strings.NewReader(password)
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("could not copy local password with pbcopy")
+			}
+			password = "copied to clipboard (not printed)"
 		}
 		fmt.Printf("Gmail backend: %s\n", c.BackendName())
 		if c.BackendName() == "gws" {
@@ -132,7 +198,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("run login first: %w", err)
 		}
-		api, err := newAPI(ctx, c)
+		api, err := newAPI(ctx, c, *concurrency, *quotaProfile)
 		if err != nil {
 			return err
 		}
@@ -140,7 +206,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		b, err := bridge.Open(*dir, c.Email, password, api)
+		b, err := bridge.Open(*dir, c.Email, password, api, bridge.Options{Workers: *concurrency})
 		if err != nil {
 			return err
 		}
@@ -159,10 +225,6 @@ func run() error {
 			return err
 		}
 		defer smtpLn.Close()
-		log.Print("Synchronizing Gmail metadata; first run can take several minutes for large mailboxes")
-		if err = b.Sync(ctx); err != nil {
-			return fmt.Errorf("initial Gmail synchronization failed: %w", err)
-		}
 		im := imapserver.New(&imapserver.Options{NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return b.NewSession(), nil, nil
 		}, Caps: imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapIdle: {}, imap.CapSpecialUse: {}, imap.CapUnselect: {}}, TLSConfig: tlsConfig})
@@ -179,7 +241,7 @@ func run() error {
 		errors := make(chan error, 2)
 		go func() { errors <- im.Serve(imapLn) }()
 		go func() { errors <- sm.Serve(smtpLn) }()
-		log.Printf("Ready: IMAP TLS %s; SMTP TLS %s; Gmail API polling every %s", *imapAddr, *smtpAddr, *interval)
+		log.Printf("Ready: IMAP TLS %s; SMTP TLS %s; serving cached/partial mail while Gmail sync runs (%d readers, %s quota)", *imapAddr, *smtpAddr, *concurrency, *quotaProfile)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -222,7 +284,7 @@ func connectOAuth(ctx context.Context, credentials, email string) (auth.Config, 
 	}
 	client := c.OAuth().Client(context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Timeout: 30 * time.Second}), token)
 	client.Timeout = 30 * time.Second
-	profile, err := (&gmail.Client{HTTP: client}).Profile(ctx)
+	profile, err := (&gmail.Client{HTTP: client, Email: c.Email}).Profile(ctx)
 	if err != nil {
 		return c, err
 	}
@@ -232,16 +294,26 @@ func connectOAuth(ctx context.Context, credentials, email string) (auth.Config, 
 	return c, auth.SaveToken(c.Email, token)
 }
 
-func newAPI(ctx context.Context, c auth.Config) (bridge.API, error) {
+func newAPI(ctx context.Context, c auth.Config, concurrency int, quotaProfile string) (bridge.API, error) {
+	if !gmail.ValidQuotaProfile(quotaProfile) {
+		return nil, fmt.Errorf("quota profile must be current or legacy")
+	}
 	switch c.BackendName() {
 	case "gws":
-		return gws.New(c.GWSPath, c.Email)
+		client, err := gws.New(c.GWSPath, c.Email, concurrency)
+		if err != nil {
+			return nil, err
+		}
+		if err = client.SetQuotaProfile(quotaProfile); err != nil {
+			return nil, err
+		}
+		return client, nil
 	case "oauth":
 		httpClient, err := auth.Client(ctx, c)
 		if err != nil {
 			return nil, err
 		}
-		return &gmail.Client{HTTP: httpClient}, nil
+		return &gmail.Client{HTTP: httpClient, Email: c.Email, QuotaProfile: quotaProfile}, nil
 	default:
 		return nil, fmt.Errorf("unknown saved backend %q; run login with --backend gws or --backend oauth", c.Backend)
 	}
@@ -252,12 +324,15 @@ func usage() {
 
 Commands:
   login     Connect an authenticated gws CLI or a Google Desktop OAuth app
-  settings  Show Apple Mail ports, certificate path, and local bridge password
+  settings  Show Apple Mail setup; --copy-password avoids printing the password
   serve     Synchronize Gmail and serve IMAP + SMTP over TLS on loopback
+  probe     Read-only metadata diagnostic and throughput measurement
+  install-agent    Install and load the per-user macOS LaunchAgent
+  uninstall-agent  Unload and remove the LaunchAgent (keeps mail data)
 
 Start:
   mailme login --backend gws --email you@company.com
-  mailme settings
+  mailme settings --copy-password
   mailme serve
 
 Or use a Desktop OAuth app:

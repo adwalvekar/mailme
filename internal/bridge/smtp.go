@@ -86,6 +86,8 @@ func (s *smtpSession) Data(r io.Reader) error {
 	}
 	ctx, cancel := context.WithTimeout(s.b.ctx, 60*time.Second)
 	defer cancel()
+	s.b.mutations.Lock()
+	defer s.b.mutations.Unlock()
 	if err = s.b.api.Send(ctx, raw); err != nil {
 		log.Printf("Gmail send failed (not retried by bridge): %v", err)
 		// A transport failure can occur after Google accepts mail. A permanent

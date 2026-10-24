@@ -14,14 +14,20 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	message "github.com/emersion/go-message"
 	_ "github.com/emersion/go-message/charset"
+	"mailme/internal/gmail"
 )
 
 func (s *Session) Search(kind imapserver.NumKind, c *imap.SearchCriteria, _ *imap.SearchOptions) (*imap.SearchData, error) {
 	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
 	ctx, cancel := context.WithTimeout(s.b.ctx, 15*time.Minute)
 	defer cancel()
 	messages := s.selected(imap.SeqSet{{Start: 1, Stop: 0}})
+	// Keep immutable records so flags/date filters see one command snapshot.
+	records := make(map[string]*Record, len(messages))
+	for _, m := range messages {
+		records[m.id] = s.b.state.Messages[m.id]
+	}
+	s.b.mu.Unlock()
 	var seqs imap.SeqSet
 	var uids imap.UIDSet
 	var maxSeq uint32
@@ -36,7 +42,7 @@ func (s *Session) Search(kind imapserver.NumKind, c *imap.SearchCriteria, _ *ima
 	}
 	data := &imap.SearchData{}
 	for _, m := range messages {
-		r := s.b.state.Messages[m.id]
+		r := records[m.id]
 		var raw []byte
 		getRaw := func() ([]byte, error) {
 			if raw != nil {
@@ -108,16 +114,19 @@ func matchSearch(c *imap.SearchCriteria, r *Record, fs []imap.Flag, m selected, 
 		return false, nil
 	}
 	if len(c.Header)+len(c.Body)+len(c.Text) > 0 || c.Larger > 0 || c.Smaller > 0 || !c.SentSince.IsZero() || !c.SentBefore.IsZero() {
-		buf, err := raw()
-		if err != nil {
-			return false, err
-		}
-		if c.Larger > 0 && int64(len(buf)) <= c.Larger || c.Smaller > 0 && int64(len(buf)) >= c.Smaller {
-			return false, nil
-		}
-		e, err := message.Read(bytes.NewReader(buf))
+		e := metadataEntity(c, r)
 		if e == nil {
-			return false, errors.New("cannot parse message MIME content")
+			buf, err := raw()
+			if err != nil {
+				return false, err
+			}
+			if c.Larger > 0 && int64(len(buf)) <= c.Larger || c.Smaller > 0 && int64(len(buf)) >= c.Smaller {
+				return false, nil
+			}
+			e, _ = message.Read(bytes.NewReader(buf))
+			if e == nil {
+				return false, errors.New("cannot parse message MIME content")
+			}
 		}
 		for _, h := range c.Header {
 			ok := false
@@ -184,6 +193,32 @@ func matchSearch(c *imap.SearchCriteria, r *Record, fs []imap.Flag, m selected, 
 		}
 	}
 	return true, nil
+}
+
+func metadataEntity(c *imap.SearchCriteria, r *Record) *message.Entity {
+	if r.Message.Payload == nil || len(c.Body)+len(c.Text) > 0 || c.Larger > 0 || c.Smaller > 0 {
+		return nil
+	}
+	for _, header := range c.Header {
+		included := false
+		for _, name := range gmail.MetadataHeaders {
+			if strings.EqualFold(header.Key, name) {
+				included = true
+				break
+			}
+		}
+		// IMAP HEADER accepts arbitrary names; absence from our projection does
+		// not mean absence from the real message. Fall back to the complete MIME.
+		if !included {
+			return nil
+		}
+	}
+	e := &message.Entity{}
+	h := r.Message.Payload.Headers
+	for i := len(h) - 1; i >= 0; i-- {
+		e.Header.Add(h[i].Name, h[i].Value)
+	}
+	return e
 }
 func dateMatches(t, since, before time.Time) bool {
 	d := func(t time.Time) time.Time { return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC) }

@@ -4,15 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/emersion/go-imap/v2/imapserver"
 	"mailme/internal/gmail"
@@ -31,20 +27,45 @@ type API interface {
 }
 
 type Bridge struct {
-	// Serialize synchronization and mutations so an older API snapshot cannot
-	// overwrite a successful STORE, and sequence numbers cannot shift mid-command.
-	mu       sync.Mutex
-	api      API
-	disk     *disk
-	state    *state
-	trackers map[string]*imapserver.MailboxTracker
-	password [32]byte
-	email    string
-	ctx      context.Context
-	cancel   context.CancelFunc
+	// mu protects immutable state snapshots and commits; never hold it for API I/O.
+	mu         sync.Mutex
+	syncMu     sync.Mutex
+	mutations  sync.Mutex // order complete local mutation commands, independently of readers
+	versions   map[string]uint64
+	workers    int
+	batchSize  int
+	rawMu      sync.Mutex
+	rawFlights map[string]*rawFlight
+	rawWG      sync.WaitGroup
+	closing    bool
+	api        API
+	disk       *disk
+	state      *state
+	trackers   map[string]*imapserver.MailboxTracker
+	password   [32]byte
+	email      string
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-func Open(dir, email, password string, api API) (*Bridge, error) {
+type Options struct {
+	Workers   int
+	BatchSize int
+}
+
+func Open(dir, email, password string, api API, options ...Options) (*Bridge, error) {
+	o := Options{Workers: 6, BatchSize: 250}
+	if len(options) > 0 {
+		if options[0].Workers != 0 {
+			o.Workers = options[0].Workers
+		}
+		if options[0].BatchSize != 0 {
+			o.BatchSize = options[0].BatchSize
+		}
+	}
+	if o.Workers < 1 || o.Workers > 16 || o.BatchSize < 1 || o.BatchSize > 500 {
+		return nil, fmt.Errorf("invalid sync worker or checkpoint batch size")
+	}
 	if len(password) < 24 {
 		return nil, fmt.Errorf("bridge password must contain at least 24 characters")
 	}
@@ -54,14 +75,36 @@ func Open(dir, email, password string, api API) (*Bridge, error) {
 		return nil, err
 	}
 	b := &Bridge{api: api, disk: d, state: st, email: email, password: sha256.Sum256([]byte(password)), trackers: map[string]*imapserver.MailboxTracker{}}
+	b.workers, b.batchSize = o.Workers, o.BatchSize
+	b.versions = make(map[string]uint64)
+	b.rawFlights = make(map[string]*rawFlight)
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	for id, f := range st.Folders {
 		b.trackers[id] = imapserver.NewMailboxTracker(uint32(len(f.Members)))
 	}
+	// Persist even an empty INBOX's UIDVALIDITY before clients can select it.
+	if err := d.save(st); err != nil {
+		b.cancel()
+		d.db.Close()
+		return nil, err
+	}
 	return b, nil
 }
-func (b *Bridge) Stop()        { b.cancel() }
-func (b *Bridge) Close() error { b.Stop(); b.mu.Lock(); defer b.mu.Unlock(); return b.disk.db.Close() }
+func (b *Bridge) Stop() { b.cancel() }
+func (b *Bridge) Close() error {
+	b.Stop()
+	b.rawMu.Lock()
+	b.closing = true
+	b.rawMu.Unlock()
+	b.rawWG.Wait()
+	b.syncMu.Lock()
+	defer b.syncMu.Unlock()
+	b.mutations.Lock()
+	defer b.mutations.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.disk.db.Close()
+}
 func (b *Bridge) Authenticate(user, password string) bool {
 	h := sha256.Sum256([]byte(password))
 	return subtle.ConstantTimeCompare(h[:], b.password[:]) == 1 && strings.EqualFold(user, b.email)
@@ -110,66 +153,6 @@ func (b *Bridge) commit(next *state) error {
 }
 func is404(err error) bool { var e *gmail.APIError; return errors.As(err, &e) && e.Status == 404 }
 
-func (b *Bridge) Sync(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	labels, err := b.api.Labels(ctx)
-	if err != nil {
-		return err
-	}
-	next := clone(b.state)
-	next.setLabels(labels)
-	var ids []string
-	var history string
-	full := next.History == ""
-	if !full {
-		ids, history, err = b.api.Changes(ctx, next.History)
-		if is404(err) {
-			full = true
-		} else if err != nil {
-			return err
-		}
-	}
-	if full {
-		// Capture the cursor BEFORE listing: a subsequent delta catches mutations
-		// that happen while the full snapshot is being collected.
-		p, err := b.api.Profile(ctx)
-		if err != nil {
-			return err
-		}
-		if !strings.EqualFold(p.Email, b.email) {
-			return fmt.Errorf("OAuth account does not match configured email")
-		}
-		history = p.HistoryID
-		ids, err = b.api.IDs(ctx)
-		if err != nil {
-			return err
-		}
-		present := map[string]bool{}
-		for _, id := range ids {
-			present[id] = true
-		}
-		for id := range next.Messages {
-			if !present[id] {
-				delete(next.Messages, id)
-			}
-		}
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		m, err := b.api.Message(ctx, id, "metadata")
-		if is404(err) {
-			delete(next.Messages, id)
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		putRecord(next, m)
-	}
-	next.History = history
-	return b.commit(next)
-}
 func putRecord(st *state, m *gmail.Message) {
 	r := st.Messages[m.ID]
 	if r == nil {
@@ -177,74 +160,16 @@ func putRecord(st *state, m *gmail.Message) {
 		st.Messages[m.ID] = r
 	}
 	date := r.Message.InternalDate
+	payload, thread := r.Message.Payload, r.Message.ThreadID
 	r.Message = *m
 	r.Message.Raw = ""
 	if r.Message.InternalDate == "" {
 		r.Message.InternalDate = date
 	}
-}
-func (b *Bridge) RunSync(ctx context.Context, interval time.Duration) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := b.Sync(ctx); err != nil && ctx.Err() == nil {
-				log.Printf("Gmail sync failed; retaining last complete snapshot: %v", err)
-			}
-		}
+	if r.Message.Payload == nil {
+		r.Message.Payload = payload
 	}
-}
-func (b *Bridge) raw(ctx context.Context, id string) ([]byte, error) {
-	raw, err := b.disk.raw(id)
-	if err != nil || len(raw) > 0 {
-		return raw, err
+	if r.Message.ThreadID == "" {
+		r.Message.ThreadID = thread
 	}
-	m, err := b.api.Message(ctx, id, "raw")
-	if err != nil {
-		return nil, err
-	}
-	raw, err = base64.RawURLEncoding.DecodeString(strings.TrimRight(m.Raw, "="))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) == 0 {
-		return nil, fmt.Errorf("Gmail returned empty message content")
-	}
-	if err = b.disk.putRaw(id, raw); err != nil {
-		return nil, err
-	}
-	return raw, nil
-}
-
-// Mutation responses do not advance the history checkpoint: doing so could skip
-// unrelated changes made by another client.
-func (b *Bridge) modify(ctx context.Context, id string, add, remove []string) error {
-	m, err := b.api.Modify(ctx, id, add, remove)
-	if err != nil {
-		return err
-	}
-	next := clone(b.state)
-	putRecord(next, m)
-	return b.commit(next)
-}
-func (b *Bridge) trash(ctx context.Context, id string) error {
-	m, err := b.api.Trash(ctx, id)
-	if err != nil {
-		return err
-	}
-	next := clone(b.state)
-	putRecord(next, m)
-	return b.commit(next)
-}
-func (b *Bridge) untrash(ctx context.Context, id string) error {
-	m, err := b.api.Untrash(ctx, id)
-	if err != nil {
-		return err
-	}
-	next := clone(b.state)
-	putRecord(next, m)
-	return b.commit(next)
 }

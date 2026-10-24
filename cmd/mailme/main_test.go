@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zalando/go-keyring"
@@ -39,7 +41,7 @@ func TestGWSLoginAndSavedBackend(t *testing.T) {
 	// tokens in Keychain or requiring the interactive shell's PATH.
 	t.Setenv("PATH", t.TempDir())
 	keyring.MockInitWithError(errors.New("OAuth Keychain access must not happen"))
-	api, err := newAPI(context.Background(), c)
+	api, err := newAPI(context.Background(), c, 6, "current")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +55,49 @@ func TestGWSLoginAndSavedBackend(t *testing.T) {
 	}
 }
 
+func TestSettingsCopiesWithoutPrintingPassword(t *testing.T) {
+	keyring.MockInit()
+	t.Cleanup(keyring.MockInit)
+	dir := t.TempDir()
+	if err := auth.Save(dir, auth.Config{Email: "me@example.com", Backend: "gws"}); err != nil {
+		t.Fatal(err)
+	}
+	password, err := auth.EnsurePassword("me@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	// Test-only clipboard sink; never invoke the real pbcopy.
+	if err := os.WriteFile(filepath.Join(bin, "pbcopy"), []byte("#!/bin/sh\nexec /bin/cat > \"$MAILME_TEST_CLIPBOARD\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	clipboard := filepath.Join(t.TempDir(), "clipboard")
+	t.Setenv("PATH", bin)
+	t.Setenv("MAILME_TEST_CLIPBOARD", clipboard)
+	oldArgs, oldStdout := os.Args, os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Args = []string{"mailme", "settings", "--data-dir", dir, "--copy-password"}
+	os.Stdout = w
+	t.Cleanup(func() { os.Args = oldArgs; os.Stdout = oldStdout; r.Close(); w.Close() })
+	err = run()
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _ := io.ReadAll(r)
+	if strings.Contains(string(output), password) || !strings.Contains(string(output), "copied to clipboard") {
+		t.Fatal("password was printed or clipboard status missing")
+	}
+	got, _ := os.ReadFile(clipboard)
+	if string(got) != password {
+		t.Fatal("clipboard sink did not receive password")
+	}
+}
+
 func TestGWSLoginRejectsWrongAccountAndInvalidBackend(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gws")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s' '{\"emailAddress\":\"other@example.com\",\"historyId\":\"123\"}'\n"), 0700); err != nil {
@@ -61,8 +106,11 @@ func TestGWSLoginRejectsWrongAccountAndInvalidBackend(t *testing.T) {
 	if c, err := connectGWS(context.Background(), path, "me@example.com"); err == nil || c.Email != "" {
 		t.Fatalf("wrong account accepted: %+v %v", c, err)
 	}
-	if _, err := newAPI(context.Background(), auth.Config{Backend: "typo"}); err == nil {
+	if _, err := newAPI(context.Background(), auth.Config{Backend: "typo"}, 6, "current"); err == nil {
 		t.Fatal("unknown saved backend accepted")
+	}
+	if _, err := newAPI(context.Background(), auth.Config{Backend: "gws"}, 6, "typo"); err == nil {
+		t.Fatal("unknown quota profile accepted")
 	}
 	if _, err := connectGWS(context.Background(), filepath.Join(t.TempDir(), "missing-gws"), "me@example.com"); err == nil {
 		t.Fatal("missing executable accepted")

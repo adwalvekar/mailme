@@ -113,8 +113,8 @@ func (s *Session) subscribe(name string, value bool) error {
 }
 func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, opts *imap.ListOptions) error {
 	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
 	if len(patterns) == 0 || len(patterns) == 1 && patterns[0] == "" {
+		s.b.mu.Unlock()
 		return w.WriteList(&imap.ListData{Mailbox: "", Delim: '/', Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect}})
 	}
 	var folders []*Folder
@@ -144,6 +144,7 @@ func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 		folders = append(folders, f)
 	}
 	sort.Slice(folders, func(i, j int) bool { return folders[i].Name < folders[j].Name })
+	var output []*imap.ListData
 	for _, f := range folders {
 		if opts.SelectSubscribed && !f.Subscribed || opts.SelectSpecialUse && f.Attr == "" {
 			continue
@@ -171,6 +172,10 @@ func (s *Session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 		if opts.ReturnStatus != nil && f.ID != "" {
 			d.Status = s.status(f, opts.ReturnStatus)
 		}
+		output = append(output, d)
+	}
+	s.b.mu.Unlock()
+	for _, d := range output {
 		if err := w.WriteList(d); err != nil {
 			return err
 		}
@@ -310,8 +315,6 @@ func (s *Session) selected(set imap.NumSet) []selected {
 	return out
 }
 func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, o *imap.FetchOptions) error {
-	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
 	ctx, cancel := context.WithTimeout(s.b.ctx, 10*time.Minute)
 	defer cancel()
 	markSeen := false
@@ -320,9 +323,12 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, o *imap.Fetc
 			markSeen = true
 		}
 	}
-	needsRaw := o.RFC822Size || o.Envelope || o.BodyStructure != nil || len(o.BodySection) > 0
-	for _, m := range s.selected(set) {
-		r := s.b.state.Messages[m.id]
+	for _, m := range s.snapshotSelected(set) {
+		r := s.b.record(m.id)
+		if r == nil {
+			continue
+		}
+		needsRaw := o.RFC822Size || o.BodyStructure != nil || len(o.BodySection) > 0 || o.Envelope && r.Message.Payload == nil
 		var raw []byte
 		if needsRaw {
 			var err error
@@ -332,18 +338,32 @@ func (s *Session) Fetch(w *imapserver.FetchWriter, set imap.NumSet, o *imap.Fetc
 			}
 		}
 		if markSeen && !s.readOnly && contains(r.Message.LabelIDs, "UNREAD") {
-			if err := s.b.modify(ctx, m.id, nil, []string{"UNREAD"}); err != nil {
+			s.b.mutations.Lock()
+			err := s.b.modify(ctx, m.id, nil, []string{"UNREAD"})
+			s.b.mutations.Unlock()
+			if err != nil {
 				return protocolError(err)
 			}
-			r = s.b.state.Messages[m.id]
+			if current := s.b.record(m.id); current != nil {
+				r = current
+			}
 		}
 		// Parse before opening a response: a parse error must not leave the IMAP
 		// encoder locked with an unterminated FETCH response.
 		var envelope *imap.Envelope
 		if o.Envelope {
-			h, err := textproto.ReadHeader(bufio.NewReader(bytes.NewReader(raw)))
-			if err != nil {
-				return no("Message has malformed MIME headers")
+			var h textproto.Header
+			if r.Message.Payload != nil {
+				fields := r.Message.Payload.Headers
+				for i := len(fields) - 1; i >= 0; i-- {
+					h.Add(fields[i].Name, fields[i].Value)
+				}
+			} else {
+				var err error
+				h, err = textproto.ReadHeader(bufio.NewReader(bytes.NewReader(raw)))
+				if err != nil {
+					return no("Message has malformed MIME headers")
+				}
 			}
 			envelope = imapserver.ExtractEnvelope(h)
 		}
@@ -400,8 +420,8 @@ func hasFlag(fs []imap.Flag, want imap.Flag) bool {
 	return false
 }
 func (s *Session) Store(w *imapserver.FetchWriter, set imap.NumSet, op *imap.StoreFlags, _ *imap.StoreOptions) error {
-	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
+	s.b.mutations.Lock()
+	defer s.b.mutations.Unlock()
 	if s.readOnly {
 		return no("Mailbox is read-only")
 	}
@@ -412,8 +432,11 @@ func (s *Session) Store(w *imapserver.FetchWriter, set imap.NumSet, op *imap.Sto
 	}
 	ctx, cancel := context.WithTimeout(s.b.ctx, 2*time.Minute)
 	defer cancel()
-	for _, m := range s.selected(set) {
-		r := s.b.state.Messages[m.id]
+	for _, m := range s.snapshotSelected(set) {
+		r := s.b.record(m.id)
+		if r == nil {
+			continue
+		}
 		old := flags(r, s.folder)
 		want := func(f imap.Flag) bool {
 			has := hasFlag(op.Flags, f)
@@ -447,12 +470,17 @@ func (s *Session) Store(w *imapserver.FetchWriter, set imap.NumSet, op *imap.Sto
 				return protocolError(err)
 			}
 		}
-		next := clone(s.b.state)
-		r = next.Messages[m.id]
-		r.Answered = want(imap.FlagAnswered)
-		r.Deleted[s.folder] = want(imap.FlagDeleted)
-		if err := s.b.commit(next); err != nil {
+		if err := s.b.update(func(next *state) {
+			if current := next.Messages[m.id]; current != nil {
+				current.Answered = want(imap.FlagAnswered)
+				current.Deleted[s.folder] = want(imap.FlagDeleted)
+			}
+		}); err != nil {
 			return protocolError(err)
+		}
+		r = s.b.record(m.id)
+		if r == nil {
+			continue
 		}
 		if !op.Silent {
 			resp := w.CreateMessage(m.seq)
@@ -466,9 +494,11 @@ func (s *Session) Store(w *imapserver.FetchWriter, set imap.NumSet, op *imap.Sto
 	return nil
 }
 func (s *Session) Copy(set imap.NumSet, dest string) (*imap.CopyData, error) {
+	s.b.mutations.Lock()
+	defer s.b.mutations.Unlock()
 	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
 	f, err := s.find(dest)
+	s.b.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -480,11 +510,14 @@ func (s *Session) Copy(set imap.NumSet, dest string) (*imap.CopyData, error) {
 	}
 	ctx, cancel := context.WithTimeout(s.b.ctx, 2*time.Minute)
 	defer cancel()
-	for _, m := range s.selected(set) {
+	for _, m := range s.snapshotSelected(set) {
 		if f.ID == "TRASH" {
 			err = s.b.trash(ctx, m.id)
 		} else {
-			r := s.b.state.Messages[m.id]
+			r := s.b.record(m.id)
+			if r == nil {
+				continue
+			}
 			if contains(r.Message.LabelIDs, "TRASH") {
 				if err = s.b.untrash(ctx, m.id); err != nil {
 					return nil, protocolError(err)
@@ -508,11 +541,12 @@ func (s *Session) Copy(set imap.NumSet, dest string) (*imap.CopyData, error) {
 	return nil, nil // UIDPLUS is deliberately not advertised.
 }
 func (s *Session) Expunge(_ *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
+	s.b.mutations.Lock()
+	defer s.b.mutations.Unlock()
 	if s.readOnly {
 		return nil
 	}
+	s.b.mu.Lock()
 	f := s.b.state.Folders[s.folder]
 	var ids []string
 	for _, id := range sortedIDs(f) {
@@ -520,6 +554,7 @@ func (s *Session) Expunge(_ *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 			ids = append(ids, id)
 		}
 	}
+	s.b.mu.Unlock()
 	if len(ids) == 0 {
 		return nil
 	}
@@ -541,4 +576,10 @@ func (s *Session) Expunge(_ *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 		}
 	}
 	return nil
+}
+
+func (s *Session) snapshotSelected(set imap.NumSet) []selected {
+	s.b.mu.Lock()
+	defer s.b.mu.Unlock()
+	return s.selected(set)
 }

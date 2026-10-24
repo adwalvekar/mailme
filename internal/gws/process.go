@@ -51,7 +51,7 @@ func (c *Client) invoke(ctx context.Context, args []string, out any) error {
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
 	if stdout.overflow {
-		return errors.New("gws response exceeds 64 MiB limit")
+		return errMalformedResponse
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -61,11 +61,9 @@ func (c *Client) invoke(ctx context.Context, args []string, out any) error {
 	var envelope map[string]json.RawMessage
 	decodeErr := json.Unmarshal(stdout.buffer.Bytes(), &envelope)
 	if decodeErr == nil && envelope["error"] != nil {
-		var apiErr struct {
-			Code int `json:"code"`
-		}
-		if json.Unmarshal(envelope["error"], &apiErr) == nil && apiErr.Code >= 400 && apiErr.Code <= 599 {
-			return &gmail.APIError{Status: apiErr.Code}
+		apiErr := gmail.ParseAPIError(stdout.buffer.Bytes(), 0)
+		if apiErr.Status != 0 {
+			return apiErr
 		}
 		return errors.New("gws reported an error; check CLI authentication and Gmail API permissions")
 	}
@@ -77,10 +75,10 @@ func (c *Client) invoke(ctx context.Context, args []string, out any) error {
 		return errors.New("cannot execute gws; check the configured executable path")
 	}
 	if decodeErr != nil || envelope == nil {
-		return errors.New("gws returned invalid JSON; expected one Gmail API object")
+		return errMalformedResponse
 	}
 	if err := json.Unmarshal(stdout.buffer.Bytes(), out); err != nil {
-		return errors.New("gws returned an unexpected Gmail API response")
+		return errMalformedResponse
 	}
 	return nil
 }
