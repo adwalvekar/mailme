@@ -37,6 +37,15 @@ type state struct {
 	History  string
 	Messages map[string]*Record
 	Folders  map[string]*Folder
+	Pending  *snapshot         `json:",omitempty"`
+	Skipped  map[string]string `json:",omitempty"` // ID -> sanitized last error
+}
+type snapshot struct {
+	History string
+	IDs     []string
+	Listed  bool
+	Done    map[string]bool
+	Touched map[string]bool // local mutations since this snapshot began
 }
 type disk struct{ db *bolt.DB }
 
@@ -68,6 +77,12 @@ func openDisk(dir, email string) (*disk, *state, error) {
 	})
 	if err == nil && st.Email != email {
 		err = fmt.Errorf("cache belongs to a different account; use a separate --data-dir")
+	}
+	if st.Skipped == nil {
+		st.Skipped = make(map[string]string)
+	}
+	if len(st.Folders) == 0 {
+		st.setLabels(nil)
 	}
 	if err != nil {
 		db.Close()
@@ -104,9 +119,41 @@ func (d *disk) putRaw(id string, raw []byte) error {
 	return d.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("raw")).Put([]byte(id), raw) })
 }
 func clone(st *state) *state {
-	b, _ := json.Marshal(st)
-	var next state
-	_ = json.Unmarshal(b, &next)
+	next := *st
+	next.Messages = make(map[string]*Record, len(st.Messages))
+	for id, r := range st.Messages {
+		copy := *r
+		copy.Deleted = make(map[string]bool, len(r.Deleted))
+		for k, v := range r.Deleted {
+			copy.Deleted[k] = v
+		}
+		next.Messages[id] = &copy
+	}
+	next.Folders = make(map[string]*Folder, len(st.Folders))
+	for id, f := range st.Folders {
+		copy := *f
+		copy.Members = make(map[string]imap.UID, len(f.Members))
+		for k, v := range f.Members {
+			copy.Members[k] = v
+		}
+		next.Folders[id] = &copy
+	}
+	next.Skipped = make(map[string]string, len(st.Skipped))
+	for k, v := range st.Skipped {
+		next.Skipped[k] = v
+	}
+	if st.Pending != nil {
+		p := *st.Pending
+		p.Done = make(map[string]bool, len(st.Pending.Done))
+		for k, v := range st.Pending.Done {
+			p.Done[k] = v
+		}
+		p.Touched = make(map[string]bool, len(st.Pending.Touched))
+		for k, v := range st.Pending.Touched {
+			p.Touched[k] = v
+		}
+		next.Pending = &p // IDs are immutable after listing.
+	}
 	return &next
 }
 func randomValidity() uint32 {
@@ -194,7 +241,8 @@ func (st *state) setLabels(labels []gmail.Label) {
 }
 
 // Preserve UIDs for surviving memberships; a removed/re-added message gets a
-// new UID. Deterministic date order makes first sync pleasant in mail clients.
+// new UID. New members are sorted within each commit, then appended to the UID
+// space; late backfill never renumbers an already published message.
 func (st *state) reconcile() error {
 	ids := make([]string, 0, len(st.Messages))
 	for id := range st.Messages {
