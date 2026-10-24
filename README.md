@@ -203,6 +203,8 @@ If Google blocks authorization, use the organization's app approval process. If 
 
 ## Validation
 
+GitHub Actions runs the [CI workflow](.github/workflows/ci.yml) on pushes and pull requests, with manual runs also available. It verifies module checksums, runs race tests and `go vet`, and builds the binary on Linux with Go 1.24 and macOS with current stable Go. The workflow uses mock services and needs no Gmail credentials or installed `gws`.
+
 ```sh
 go test -race ./...
 go vet ./...
