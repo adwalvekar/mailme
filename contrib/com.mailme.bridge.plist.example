@@ -3,8 +3,7 @@
 <!-- Replace every /ABSOLUTE/PATH placeholder before installing.
      launchd does not expand ~ or environment variables in these strings.
      Create the log directory first. This template is not installed automatically.
-     For gws: login saves an absolute executable path. A wrapper may still need
-     its runtime on PATH; add EnvironmentVariables if needed. Reproduce any
+     For gws: login resolves the npm shim to its native executable. Reproduce any
      custom gws authentication/config environment used by your interactive shell. -->
 <plist version="1.0">
 <dict>
@@ -15,11 +14,13 @@
     <string>serve</string>
     <string>--data-dir</string>
     <string>/ABSOLUTE/PATH/Library/Application Support/mailme</string>
+    <string>--read-concurrency</string><string>6</string>
+    <string>--quota-profile</string><string>current</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme.log</string>
-  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme.log</string>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme/bridge.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme/bridge.log</string>
 </dict>
 </plist>
