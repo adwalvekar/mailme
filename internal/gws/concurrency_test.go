@@ -179,15 +179,20 @@ func TestSimulatedThroughput(t *testing.T) {
 	if os.Getenv("MAILME_BENCHMARK") != "1" {
 		t.Skip("opt-in simulated latency benchmark")
 	}
-	for _, concurrency := range []int{1, 6} {
-		t.Run(fmt.Sprint(concurrency), func(t *testing.T) {
+	for _, test := range []struct {
+		profile     string
+		concurrency int
+	}{{"legacy", 1}, {"legacy", 6}, {"current", 6}} {
+		concurrency := test.concurrency
+		t.Run(fmt.Sprintf("%s/%d", test.profile, concurrency), func(t *testing.T) {
 			c, _ := fakeCLI(t, "concurrent")
+			c.SetQuotaProfile(test.profile)
 			c.gate = make(chan struct{}, concurrency)
 			t.Setenv("MAILME_TEST_DELAY_MS", "370")
 			start := time.Now()
 			parallelReads(t, c, 60)
 			elapsed := time.Since(start)
-			t.Logf("SIMULATED: concurrency=%d fetched=60 elapsed=%s rate=%.2f messages/s projected-16650=%s", concurrency, elapsed.Round(time.Millisecond), 60/elapsed.Seconds(), (elapsed * 16650 / 60).Round(time.Second))
+			t.Logf("SIMULATED: quota=%s concurrency=%d fetched=60 elapsed=%s rate=%.2f messages/s projected-16650=%s", test.profile, concurrency, elapsed.Round(time.Millisecond), 60/elapsed.Seconds(), (elapsed * 16650 / 60).Round(time.Second))
 		})
 	}
 }

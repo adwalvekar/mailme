@@ -219,6 +219,7 @@ func fakeCLI(t *testing.T, scenario string) (*Client, string) {
 	// Most command contract tests start with an already-warmed credential cache.
 	// Dedicated concurrency tests exercise startup and 401 recovery probes.
 	c.authReady = true
+	c.SetQuotaProfile("legacy")
 	return c, logPath
 }
 

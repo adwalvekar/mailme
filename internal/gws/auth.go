@@ -58,7 +58,7 @@ func (c *Client) probeAuth(ctx context.Context) (uint64, error) {
 	var profile gmail.Profile
 	var err error
 	for attempt := 0; ; attempt++ {
-		err = c.pace.Wait(ctx, gmail.Cost("getProfile"))
+		err = c.pace.Wait(ctx, gmail.Cost("getProfile", "", c.quotaProfile), c.quotaProfile)
 		if err == nil {
 			err = c.invoke(ctx, []string{"gmail", "users", "getProfile", "--params", string(params), "--format", "json"}, &profile)
 		}

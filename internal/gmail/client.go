@@ -47,11 +47,12 @@ type Profile struct {
 	HistoryID string `json:"historyId"`
 }
 type Client struct {
-	HTTP    *http.Client
-	BaseURL string // Override only in tests.
-	Email   string
-	writeMu sync.Mutex
-	pace    Pacer
+	HTTP         *http.Client
+	BaseURL      string // Override only in tests.
+	Email        string
+	QuotaProfile string // empty means current; set before making any requests
+	writeMu      sync.Mutex
+	pace         Pacer
 }
 
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
@@ -67,6 +68,8 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		defer c.writeMu.Unlock()
 	}
 	apiMethod, id := requestIdentity(path)
+	_, query, _ := strings.Cut(path, "?")
+	values, _ := url.ParseQuery(query)
 	var body []byte
 	var err error
 	if in != nil {
@@ -78,7 +81,7 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	// Pace requests below Gmail's per-user quota. Only GET requests are retried;
 	// an ambiguous send outcome must never cause an automatic duplicate send.
 	for attempt := 0; ; attempt++ {
-		if err := c.pace.Wait(ctx, Cost(apiMethod)); err != nil {
+		if err := c.pace.Wait(ctx, Cost(apiMethod, values.Get("format"), c.QuotaProfile), c.QuotaProfile); err != nil {
 			return err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))

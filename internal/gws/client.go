@@ -18,15 +18,16 @@ import (
 )
 
 type Client struct {
-	path, email string
-	gate        chan struct{}
-	writeMu     sync.Mutex
-	pace        gmail.Pacer
-	authMu      authBarrier
-	authReady   bool
-	authEpoch   uint64
-	authErr     error
-	authRetry   time.Time
+	path, email  string
+	quotaProfile string
+	gate         chan struct{}
+	writeMu      sync.Mutex
+	pace         gmail.Pacer
+	authMu       authBarrier
+	authReady    bool
+	authEpoch    uint64
+	authErr      error
+	authRetry    time.Time
 }
 
 func New(path, email string, concurrency ...int) (*Client, error) {
@@ -59,6 +60,15 @@ func New(path, email string, concurrency ...int) (*Client, error) {
 }
 
 func (c *Client) Path() string { return c.path }
+
+// SetQuotaProfile must be called before starting any requests.
+func (c *Client) SetQuotaProfile(profile string) error {
+	if !gmail.ValidQuotaProfile(profile) {
+		return errors.New("quota profile must be current or legacy")
+	}
+	c.quotaProfile = profile
+	return nil
+}
 
 func (c *Client) call(ctx context.Context, resource, method string, params map[string]any, body any, upload string, read bool, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -105,13 +115,14 @@ func (c *Client) call(ctx context.Context, resource, method string, params map[s
 		methodName = resource + "." + method
 	}
 	id, _ := params["id"].(string)
+	format, _ := params["format"].(string)
 	epoch, err := c.ensureAuth(ctx)
 	if err != nil {
 		return err
 	}
 	authRetried := false
 	for attempt := 0; ; attempt++ {
-		if err := c.pace.Wait(ctx, gmail.Cost(methodName)); err != nil {
+		if err := c.pace.Wait(ctx, gmail.Cost(methodName, format, c.quotaProfile), c.quotaProfile); err != nil {
 			return err
 		}
 		if err := c.authMu.lock(ctx, false); err != nil {
