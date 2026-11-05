@@ -17,6 +17,20 @@ flowchart LR
 
 SMTP handles sending; IMAP is also needed to read mail, discover folders, and synchronize changes. The organization must permit the local bridge and authorize its OAuth app. This does not override Google Workspace API access controls.
 
+## Download a release
+
+[GitHub Releases](https://github.com/adwalvekar/mailme/releases) provide an Apple Silicon macOS package, `mailme_<tag>_darwin_arm64.tar.gz`, and `SHA256SUMS`. Download both from the same release, verify the checksum, and extract the archive. For example, for `v0.1.0`:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+tar -xzf mailme_v0.1.0_darwin_arm64.tar.gz
+./mailme_v0.1.0_darwin_arm64/mailme version
+```
+
+The archive contains the executable, license, README, manual LaunchAgent example, and `BUILD.json` with its version, commit, build date, Go version, and platform. Release packages target **Apple Silicon only**. Developer ID signing and Apple notarization are not configured.
+
+Move the executable to a stable location before starting the background service, since the LaunchAgent saves that exact path. For an existing installation, stop the service before replacing the binary, then run the new binary's `install-agent` with the runtime settings you want to retain. Login, Gmail/gws access, and local certificate trust still follow the setup below; a downloaded binary removes the need to install Go.
+
 ## What works
 
 - An installed, authenticated `gws` CLI can provide all Gmail access using its existing credentials and token refresh. No additional OAuth app is needed in this mode. The local bridge password is stored separately in macOS Keychain.
@@ -332,6 +346,30 @@ To upgrade an older service, rebuild the binary at its installed location and ru
 `contrib/com.mailme.bridge.plist.example` remains available for manual setup. For `gws`, login saves the native executable path, and startup also resolves older saved npm shims. A moved nvm/CLI installation requires rerunning `login --backend gws --gws-path ...`. The installer does not copy shell environment variables or credentials into the plist. If your CLI uses a custom config directory or other authentication environment, configure the necessary `EnvironmentVariables` manually; an interactive shell's environment is not inherited by launchd. Reinstalling replaces the plist, including manual edits.
 
 The API synchronization and send semantics follow [Google's synchronization guide](https://developers.google.com/workspace/gmail/api/guides/sync) and [messages.send reference](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send).
+
+## Publish a SemVer release
+
+After the [release workflow](.github/workflows/release.yml) is merged into `main`:
+
+1. Open the repository's **Releases → Draft a new release** page.
+2. Choose **Create new tag**, enter a new SemVer tag such as `v0.1.0`, and select **Target: main**. Tags with a prerelease suffix such as `v0.2.0-rc.1` and optional build metadata are supported; the `v` prefix is optional. Numeric version components and numeric prerelease identifiers cannot have leading zeroes.
+3. Write the release notes or use GitHub's **Generate release notes**. For a prerelease tag, select GitHub's prerelease option as well.
+4. Click **Publish release**. The **Release** Actions workflow validates the tag, tests the tagged code, builds and smoke-tests the Apple Silicon executable, packages it, and attaches the archive and checksums to that same release.
+
+Saving a draft, pushing a tag alone, or editing release notes does not run this workflow. Both stable and prerelease publication trigger it through GitHub's [`release.published` event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release). The version is chosen in GitHub; no source version file needs to be edited.
+
+The workflow builds the exact tagged commit and verifies that it is in `main`'s history, rather than packaging a later branch tip. It checks the tag again before attaching assets. `mailme version`, `mailme --version`, and startup logs identify release builds; local source builds report `dev`.
+
+Only the publication job receives `contents: write`; tests and packaging run with read-only repository access. The normal GitHub Actions token uploads assets, so no personal access token or new secret is required. Your release title and notes are preserved. Assets arrive after the published release appears, once its Actions run completes. This flow requires mutable GitHub releases because assets are attached after publication; it cannot append assets to an already immutable release.
+
+If a run fails, inspect **Actions → Release** and rerun failed jobs after addressing the error. Identical uploaded assets are verified and skipped, allowing a partial upload to resume. An existing asset with different contents, a missing digest, or a moved tag causes failure instead of overwriting published bytes. Keep release tags fixed and use a new SemVer version for changed contents. A failed build leaves the manually created release in place without a complete package; it does not create another release or silently change its version.
+
+Release tooling is covered by normal CI on Linux and macOS. Its local checks do not create releases or push tags:
+
+```sh
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+go test -race ./...
+```
 
 ## License
 

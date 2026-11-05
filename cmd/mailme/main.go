@@ -54,6 +54,12 @@ func run() (runErr error) {
 		return nil
 	}
 	command := os.Args[1]
+	if command == "version" || command == "--version" || command == "-v" {
+		if len(os.Args) != 2 {
+			return fmt.Errorf("version takes no arguments")
+		}
+		return printVersion(os.Stdout)
+	}
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
 	dir := f.String("data-dir", defaultDir(), "Private configuration and mail cache directory")
 	credentials := f.String("credentials", "", "Downloaded Google Desktop OAuth client JSON (login)")
@@ -272,7 +278,7 @@ func run() (runErr error) {
 				runErr = err
 			}
 		}()
-		slog.Info("Starting bridge", "log_file", tuning.Logs.File)
+		slog.Info("Starting bridge", "version", version, "commit", commit, "log_file", tuning.Logs.File)
 		c, err := auth.Load(*dir)
 		if err != nil {
 			return fmt.Errorf("run login first: %w", err)
@@ -418,6 +424,7 @@ func usage() {
 	fmt.Println(`Mailme — local Apple Mail ↔ Gmail API bridge
 
 Commands:
+  version   Show version, source commit, build date, and platform
   login     Connect an authenticated gws CLI or a Google Desktop OAuth app
   settings  Show Apple Mail setup; --copy-password avoids printing the password
   serve     Start the macOS background service (use --foreground for terminal operation)

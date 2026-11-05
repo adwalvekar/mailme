@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    name: Test and package Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 20
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Check out the release tag and main history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate SemVer and source commit on main
+        id: release
+        run: python3 scripts/release.py validate --tag "$RELEASE_TAG" --expected-commit "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache-dependency-path: go.sum
+
+      - name: Verify Apple Silicon runner and modules
+        run: |
+          test "$(uname -m)" = arm64
+          go mod verify
+
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Test with race detector
+        run: go test -race -count=1 -timeout=5m ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build and smoke-test versioned package
+        env:
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASE_DATE: ${{ github.event.release.published_at }}
+        run: python3 scripts/release.py package --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --date "$RELEASE_DATE"
+
+      - name: Stage release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Attach packages to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recheck the release tag before publication
+        env:
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+        run: python3 scripts/release.py validate --tag "$RELEASE_TAG" --expected-commit "$RELEASE_COMMIT"
+
+      - name: Download tested packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify checksums and upload missing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: python3 scripts/release.py publish --tag "$RELEASE_TAG" --release-id "$RELEASE_ID" --repo "$GITHUB_REPOSITORY"

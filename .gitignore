@@ -6,3 +6,5 @@ client_secret*.json
 *.test
 coverage.out
 .DS_Store
+/dist/
+__pycache__/
