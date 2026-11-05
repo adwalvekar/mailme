@@ -46,6 +46,9 @@ jobs:
       - name: Verify module checksums
         run: go mod verify
 
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Test with race detector
         run: go test -race -count=1 -timeout=5m ./...
 
