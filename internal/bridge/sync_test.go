@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	bolt "go.etcd.io/bbolt"
 	"mailme/internal/gmail"
 )
 
@@ -24,6 +25,14 @@ type hookedAPI struct {
 	get     func(context.Context, string, string) (*gmail.Message, error)
 	changes func(context.Context, string) ([]string, string, error)
 	inbox   []string
+	labels  func(context.Context) ([]gmail.Label, error)
+}
+
+func (h *hookedAPI) Labels(ctx context.Context) ([]gmail.Label, error) {
+	if h.labels != nil {
+		return h.labels(ctx)
+	}
+	return h.API.Labels(ctx)
 }
 
 func (h *hookedAPI) Message(ctx context.Context, id, format string) (*gmail.Message, error) {
@@ -90,6 +99,135 @@ func TestBadMessagesAreRetriedWithoutLosingSnapshot(t *testing.T) {
 				t.Fatal("skipped ID was not retried in an empty history delta")
 			}
 		})
+	}
+}
+
+func TestIdleSyncDoesNotRewriteIndexAndPersistsCursor(t *testing.T) {
+	f := largeFake(100)
+	var labelCalls int
+	h := &hookedAPI{API: f, labels: func(ctx context.Context) ([]gmail.Label, error) {
+		labelCalls++
+		return f.Labels(ctx)
+	}}
+	dir := t.TempDir()
+	b := openAPI(t, dir, h, Options{})
+	t.Cleanup(func() {
+		if b != nil {
+			b.Close()
+		}
+	})
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	index := func() string {
+		var data string
+		if err := b.disk.db.View(func(tx *bolt.Tx) error {
+			data = string(tx.Bucket([]byte("state")).Get([]byte("index")))
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	before := index()
+	h.changes = func(context.Context, string) ([]string, string, error) { return nil, "20", nil }
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if index() != before || b.state.History != "20" || labelCalls != 1 {
+		t.Fatal("idle sync rewrote index, missed cursor, or refetched labels")
+	}
+	// Even a due, unchanged label response must avoid a full index commit.
+	b.lastLabels = time.Time{}
+	previousState := b.state
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b.state != previousState || index() != before || labelCalls != 2 {
+		t.Fatal("unchanged poll committed or failed to refresh due labels")
+	}
+	uid := b.state.Folders["INBOX"].Members["m00000"]
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b = nil
+	d, st, err := openDisk(dir, testEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.db.Close()
+	if st.History != "20" || st.Folders["INBOX"].Members["m00000"] != uid {
+		t.Fatal("lightweight cursor/UID did not survive restart")
+	}
+}
+
+func TestSkippedRetriesUseSeparateScheduleAndHistoryBypassesIt(t *testing.T) {
+	f := largeFake(1)
+	f.failID, f.errorGet = "m00000", &gmail.APIError{Status: 400, State: "INVALID_ARGUMENT"}
+	var gets int
+	h := &hookedAPI{API: f, get: func(ctx context.Context, id, format string) (*gmail.Message, error) {
+		gets++
+		return f.Message(ctx, id, format)
+	}, changes: func(context.Context, string) ([]string, string, error) { return nil, "20", nil }}
+	b := openAPI(t, t.TempDir(), h, Options{SkippedRetryInterval: time.Hour})
+	defer b.Close()
+	for n := 0; n < 4; n++ {
+		if err := b.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if gets != 2 { // snapshot and one scheduled retry, not every idle poll
+		t.Fatalf("skipped ID retried on fast polling schedule: gets=%d", gets)
+	}
+	f.errorGet = nil
+	h.changes = func(context.Context, string) ([]string, string, error) { return []string{"m00000"}, "30", nil }
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 3 || len(b.state.Skipped) != 0 || b.state.Messages["m00000"] == nil {
+		t.Fatal("changed skipped message waited for slower retry schedule")
+	}
+}
+
+func TestLabelRefreshAppliesRenameAndRemoval(t *testing.T) {
+	f := largeFake(0)
+	h := &hookedAPI{API: f}
+	b := openAPI(t, t.TempDir(), h, Options{})
+	defer b.Close()
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	validity := b.state.Folders["label1"].Validity
+	h.labels = func(context.Context) ([]gmail.Label, error) {
+		return []gmail.Label{{ID: "label1", Name: "Renamed", Type: "user"}}, nil
+	}
+	b.lastLabels = time.Time{}
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if folder := b.state.Folders["label1"]; folder.Name != "Labels/Renamed" || folder.Validity != validity {
+		t.Fatal("label rename lost identity or was ignored")
+	}
+	h.labels = func(context.Context) ([]gmail.Label, error) { return nil, nil }
+	b.lastLabels = time.Time{}
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b.state.Folders["label1"].Active {
+		t.Fatal("removed label remained active")
+	}
+}
+
+func TestRunSyncStopInterruptsLongPollWait(t *testing.T) {
+	b := openAPI(t, t.TempDir(), largeFake(0), Options{})
+	defer b.Close()
+	done := make(chan struct{})
+	go func() { b.RunSync(context.Background(), time.Hour); close(done) }()
+	b.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bridge stop left sync waiting for polling interval")
 	}
 }
 

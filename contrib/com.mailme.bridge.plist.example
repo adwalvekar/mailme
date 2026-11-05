@@ -16,6 +16,16 @@
     <string>/ABSOLUTE/PATH/Library/Application Support/mailme</string>
     <string>--read-concurrency</string><string>6</string>
     <string>--quota-profile</string><string>current</string>
+    <string>--sync-interval</string><string>5s</string>
+    <string>--label-interval</string><string>5m</string>
+    <string>--skipped-retry-interval</string><string>5m</string>
+    <string>--checkpoint-batch-size</string><string>250</string>
+    <string>--checkpoint-interval</string><string>5s</string>
+    <string>--quota-units-per-second</string><string>0</string>
+    <string>--read-retries</string><string>3</string>
+    <string>--retry-min-delay</string><string>1s</string>
+    <string>--retry-max-delay</string><string>1m0s</string>
+    <string>--request-timeout</string><string>1m0s</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

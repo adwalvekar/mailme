@@ -25,13 +25,10 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(b.ctx, cancel)
 	defer func() { stop(); cancel() }()
-	labels, err := b.api.Labels(ctx)
-	if err != nil {
+	if err := b.refreshLabels(ctx); err != nil {
 		return err
 	}
-	if err = b.update(func(st *state) { st.setLabels(labels) }); err != nil {
-		return err
-	}
+	var err error
 	b.mu.Lock()
 	pending, history := b.state.Pending, b.state.History
 	b.mu.Unlock()
@@ -52,18 +49,24 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	if pending == nil && history != "" {
 		ids, cursor, err := b.api.Changes(ctx, history)
 		if err == nil {
+			retrySkipped := !time.Now().Before(b.nextSkipped)
 			b.mu.Lock()
-			for id := range b.state.Skipped {
-				ids = append(ids, id)
+			if retrySkipped {
+				for id := range b.state.Skipped {
+					ids = append(ids, id)
+				}
 			}
 			b.mu.Unlock()
 			if err = b.fetchMetadata(ctx, unique(ids), false); err != nil {
 				return err
 			}
+			if retrySkipped {
+				b.nextSkipped = time.Now().Add(b.skippedInterval)
+			}
 			if cursor == "" {
 				return fmt.Errorf("Gmail history response has no checkpoint")
 			}
-			return b.update(func(st *state) { st.History = cursor })
+			return b.advanceHistory(cursor)
 		}
 		if !is404(err) {
 			return err
@@ -142,6 +145,58 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	})
 }
 
+func (b *Bridge) refreshLabels(ctx context.Context) error {
+	if time.Since(b.lastLabels) < b.labelInterval {
+		return nil
+	}
+	labels, err := b.api.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	// Compare only folder definitions before cloning the potentially large index.
+	want := &state{Folders: make(map[string]*Folder)}
+	want.setLabels(labels)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	changed := false
+	for id, folder := range want.Folders {
+		old := b.state.Folders[id]
+		if old == nil || !old.Active || old.Name != folder.Name || old.Attr != folder.Attr {
+			changed = true
+			break
+		}
+	}
+	for id, folder := range b.state.Folders {
+		if folder.Active && want.Folders[id] == nil {
+			changed = true
+		}
+	}
+	if changed {
+		next := clone(b.state)
+		next.setLabels(labels)
+		if err := b.commit(next); err != nil {
+			return err
+		}
+	}
+	b.lastLabels = time.Now()
+	return nil
+}
+
+func (b *Bridge) advanceHistory(cursor string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state.History == cursor {
+		return nil
+	}
+	if err := b.disk.saveHistory(cursor); err != nil {
+		return err
+	}
+	next := *b.state
+	next.History = cursor
+	b.state = &next
+	return nil
+}
+
 func unique(ids []string) []string {
 	seen := make(map[string]bool, len(ids))
 	result := make([]string, 0, len(ids))
@@ -162,6 +217,9 @@ type metadataResult struct {
 }
 
 func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) error {
+	if len(ids) == 0 {
+		return ctx.Err()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan string)
@@ -205,8 +263,9 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 	}()
 	go func() { workers.Wait(); close(results) }()
 	start, fetched := time.Now(), 0
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(b.checkpointInterval)
 	defer ticker.Stop()
+	lastProgress := time.Now()
 	progress := func() {
 		b.mu.Lock()
 		done, total, skipped := fetched, len(ids), len(b.state.Skipped)
@@ -262,7 +321,10 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 					cancel()
 				}
 			}
-			progress()
+			if time.Since(lastProgress) >= 30*time.Second {
+				progress()
+				lastProgress = time.Now()
+			}
 		case result, ok := <-results:
 			if !ok {
 				if err := flush(); err != nil {
@@ -287,7 +349,7 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 			batch = append(batch, result)
 			fetched++
 			// Publish a small first batch for quick INBOX access, then checkpoint
-			// every 250 messages or 30 seconds. Cancellation flushes successes too.
+			// at the configured batch/time limits. Cancellation flushes successes too.
 			if failure == nil && (len(batch) >= b.batchSize || fetched == b.workers) {
 				if err := flush(); err != nil {
 					failure = err
@@ -299,28 +361,35 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 }
 
 func (b *Bridge) RunSync(ctx context.Context, interval time.Duration) {
-	backoff := 2 * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	attempt := 0
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := b.Sync(ctx)
-		delay := interval
+		// Cadence is measured between starts, with a floor after slow syncs so
+		// an overrun cannot turn into a continuous catch-up loop.
+		delay := interval - time.Since(started)
+		if delay <= 0 {
+			delay = min(interval, time.Second)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			delay = backoff
-			if backoff < time.Minute {
-				backoff *= 2
-				if backoff > time.Minute {
-					backoff = time.Minute
-				}
-			}
+			delay = b.retryPolicy.Delay(attempt, err)
+			attempt = min(attempt+1, 63)
 			log.Printf("Gmail sync paused; cached mail remains available, retry in %s: %v", delay, err)
 		} else {
-			backoff = 2 * time.Second
+			attempt = 0
 		}
 		t := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-b.ctx.Done():
 			t.Stop()
 			return
 		case <-t.C:

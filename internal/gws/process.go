@@ -33,6 +33,9 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 }
 
 func (c *Client) invoke(ctx context.Context, args []string, out any) error {
+	// Queue, quota and Retry-After waits are outside the subprocess deadline.
+	ctx, timeoutCancel := context.WithTimeout(ctx, c.policy.RequestTimeout)
+	defer timeoutCancel()
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stdout := &boundedOutput{cancel: cancel}

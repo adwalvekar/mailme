@@ -109,16 +109,12 @@ func ParseAPIError(data []byte, status int) *APIError {
 
 func RetryDelay(value string, now time.Time) time.Duration {
 	if n, err := strconv.Atoi(value); err == nil && n > 0 {
-		if n > 60 {
-			n = 60
-		}
+		// Bound multiplication without shortening realistic server cooldowns.
+		n = min(n, int((1<<63-1)/int64(time.Second)))
 		return time.Duration(n) * time.Second
 	}
 	if when, err := http.ParseTime(value); err == nil {
 		d := when.Sub(now)
-		if d > time.Minute {
-			d = time.Minute
-		}
 		if d > 0 {
 			return d
 		}

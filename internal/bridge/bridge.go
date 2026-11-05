@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/emersion/go-imap/v2/imapserver"
 	"mailme/internal/gmail"
@@ -28,33 +29,45 @@ type API interface {
 
 type Bridge struct {
 	// mu protects immutable state snapshots and commits; never hold it for API I/O.
-	mu         sync.Mutex
-	syncMu     sync.Mutex
-	mutations  sync.Mutex // order complete local mutation commands, independently of readers
-	versions   map[string]uint64
-	workers    int
-	batchSize  int
-	rawMu      sync.Mutex
-	rawFlights map[string]*rawFlight
-	rawWG      sync.WaitGroup
-	closing    bool
-	api        API
-	disk       *disk
-	state      *state
-	trackers   map[string]*imapserver.MailboxTracker
-	password   [32]byte
-	email      string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	mu                 sync.Mutex
+	syncMu             sync.Mutex
+	mutations          sync.Mutex // order complete local mutation commands, independently of readers
+	versions           map[string]uint64
+	workers            int
+	batchSize          int
+	labelInterval      time.Duration
+	skippedInterval    time.Duration
+	lastLabels         time.Time // syncMu protects refresh scheduling
+	nextSkipped        time.Time
+	checkpointInterval time.Duration
+	retryPolicy        gmail.RequestPolicy
+	rawMu              sync.Mutex
+	rawFlights         map[string]*rawFlight
+	rawWG              sync.WaitGroup
+	closing            bool
+	api                API
+	disk               *disk
+	state              *state
+	trackers           map[string]*imapserver.MailboxTracker
+	password           [32]byte
+	email              string
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 type Options struct {
-	Workers   int
-	BatchSize int
+	Workers              int
+	BatchSize            int
+	LabelInterval        time.Duration
+	SkippedRetryInterval time.Duration
+	CheckpointInterval   time.Duration
+	RetryMinDelay        time.Duration
+	RetryMaxDelay        time.Duration
 }
 
 func Open(dir, email, password string, api API, options ...Options) (*Bridge, error) {
-	o := Options{Workers: 6, BatchSize: 250}
+	o := Options{Workers: 6, BatchSize: 250, LabelInterval: 5 * time.Minute, SkippedRetryInterval: 5 * time.Minute,
+		CheckpointInterval: 5 * time.Second, RetryMinDelay: 2 * time.Second, RetryMaxDelay: time.Minute}
 	if len(options) > 0 {
 		if options[0].Workers != 0 {
 			o.Workers = options[0].Workers
@@ -62,9 +75,27 @@ func Open(dir, email, password string, api API, options ...Options) (*Bridge, er
 		if options[0].BatchSize != 0 {
 			o.BatchSize = options[0].BatchSize
 		}
+		if options[0].LabelInterval != 0 {
+			o.LabelInterval = options[0].LabelInterval
+		}
+		if options[0].SkippedRetryInterval != 0 {
+			o.SkippedRetryInterval = options[0].SkippedRetryInterval
+		}
+		if options[0].CheckpointInterval != 0 {
+			o.CheckpointInterval = options[0].CheckpointInterval
+		}
+		if options[0].RetryMinDelay != 0 {
+			o.RetryMinDelay = options[0].RetryMinDelay
+		}
+		if options[0].RetryMaxDelay != 0 {
+			o.RetryMaxDelay = options[0].RetryMaxDelay
+		}
 	}
 	if o.Workers < 1 || o.Workers > 16 || o.BatchSize < 1 || o.BatchSize > 500 {
 		return nil, fmt.Errorf("invalid sync worker or checkpoint batch size")
+	}
+	if o.LabelInterval <= 0 || o.SkippedRetryInterval <= 0 || o.CheckpointInterval <= 0 || o.RetryMinDelay <= 0 || o.RetryMaxDelay < o.RetryMinDelay || o.RetryMaxDelay > time.Hour {
+		return nil, fmt.Errorf("invalid refresh, checkpoint, or retry intervals")
 	}
 	if len(password) < 24 {
 		return nil, fmt.Errorf("bridge password must contain at least 24 characters")
@@ -76,6 +107,10 @@ func Open(dir, email, password string, api API, options ...Options) (*Bridge, er
 	}
 	b := &Bridge{api: api, disk: d, state: st, email: email, password: sha256.Sum256([]byte(password)), trackers: map[string]*imapserver.MailboxTracker{}}
 	b.workers, b.batchSize = o.Workers, o.BatchSize
+	b.labelInterval, b.skippedInterval = o.LabelInterval, o.SkippedRetryInterval
+	b.checkpointInterval = o.CheckpointInterval
+	b.retryPolicy = gmail.DefaultRequestPolicy()
+	b.retryPolicy.RetryMinDelay, b.retryPolicy.RetryMaxDelay = o.RetryMinDelay, o.RetryMaxDelay
 	b.versions = make(map[string]uint64)
 	b.rawFlights = make(map[string]*rawFlight)
 	b.ctx, b.cancel = context.WithCancel(context.Background())

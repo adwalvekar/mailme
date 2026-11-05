@@ -24,7 +24,7 @@ func TestSafeErrorClassification(t *testing.T) {
 	if !PerMessage(&APIError{Status: 404}) || !PerMessage(&MalformedMessageError{ID: "a"}) {
 		t.Fatal("per-message error lost")
 	}
-	if RetryDelay("120", time.Now()) != time.Minute || RetryDelay(time.Now().Add(5*time.Second).UTC().Format(http.TimeFormat), time.Now()) < 3*time.Second {
+	if RetryDelay("120", time.Now()) != 2*time.Minute || RetryDelay(time.Now().Add(5*time.Second).UTC().Format(http.TimeFormat), time.Now()) < 3*time.Second {
 		t.Fatal("Retry-After parsing")
 	}
 }

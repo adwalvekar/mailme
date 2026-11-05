@@ -150,6 +150,76 @@ func TestGWSRateLimitAndSerializedWrites(t *testing.T) {
 	})
 }
 
+func TestConfiguredGWSRequestPolicy(t *testing.T) {
+	t.Run("zero retries disables credential read replay", func(t *testing.T) {
+		c, path := fakeCLI(t, "auth-recover")
+		policy := gmail.DefaultRequestPolicy()
+		policy.ReadRetries = 0
+		if err := c.SetRequestPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Message(context.Background(), "a", "metadata"); err == nil || len(calls(t, path)) != 1 {
+			t.Fatalf("read replayed despite zero retries: %v", err)
+		}
+	})
+	t.Run("retry count", func(t *testing.T) {
+		for _, retries := range []int{0, 2} {
+			t.Run(fmt.Sprint(retries), func(t *testing.T) {
+				c, path := fakeCLI(t, "503")
+				policy := gmail.DefaultRequestPolicy()
+				policy.ReadRetries = retries
+				policy.RetryMinDelay, policy.RetryMaxDelay = time.Millisecond, time.Millisecond
+				if err := c.SetRequestPolicy(policy); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := c.Profile(context.Background()); err == nil || len(calls(t, path)) != retries+1 {
+					t.Fatalf("retry count ignored: %v, calls=%d", err, len(calls(t, path)))
+				}
+			})
+		}
+	})
+	t.Run("shared cooldown after exhausted read", func(t *testing.T) {
+		c, path := fakeCLI(t, "cooldown")
+		policy := gmail.DefaultRequestPolicy()
+		policy.ReadRetries = 0
+		if err := c.SetRequestPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Profile(context.Background()); err == nil {
+			t.Fatal("rate limit ignored")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		if err := c.Send(ctx, []byte("test")); !errors.Is(err, context.DeadlineExceeded) || len(calls(t, path)) != 1 {
+			t.Fatalf("write escaped shared cooldown: %v", err)
+		}
+	})
+	t.Run("quota wait excluded from request timeout", func(t *testing.T) {
+		c, _ := fakeCLI(t, "")
+		policy := gmail.DefaultRequestPolicy()
+		policy.RequestTimeout = 150 * time.Millisecond
+		if err := c.SetRequestPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		c.pace.Pause(250 * time.Millisecond)
+		start := time.Now()
+		if _, err := c.Profile(context.Background()); err != nil || time.Since(start) < 240*time.Millisecond {
+			t.Fatalf("quota wait consumed subprocess deadline: %v", err)
+		}
+	})
+	t.Run("subprocess timeout", func(t *testing.T) {
+		c, _ := fakeCLI(t, "slow")
+		policy := gmail.DefaultRequestPolicy()
+		policy.RequestTimeout = 50 * time.Millisecond
+		if err := c.SetRequestPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Profile(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("subprocess deadline ignored: %v", err)
+		}
+	})
+}
+
 func TestNativeNPMBinaryResolution(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "@googleworkspace", "cli")

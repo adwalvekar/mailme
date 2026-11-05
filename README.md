@@ -27,7 +27,7 @@ SMTP handles sending; IMAP is also needed to read mail, discover folders, and sy
 - Read/unread and starred flags synchronized to Gmail. Replied and pending-deletion flags are kept locally.
 - Persistent per-folder UIDs and UIDVALIDITY, updates across simultaneous connections, and IMAP IDLE notifications after polling Gmail.
 - Immediate TLS/IMAP/SMTP service using cached or partial mail. A fresh Inbox can initially be empty; new messages appear through EXISTS/IDLE as backfill commits.
-- INBOX-first metadata backfill with six readers by default, durable batch checkpoints, and resume after a process crash. History-based sync follows every 30 seconds. Failed attempts keep completed batches without advancing the history cursor.
+- INBOX-first metadata backfill with six readers by default, durable batch checkpoints, and resume after a process crash. History-based sync follows every five seconds by default, configurable down to one second. Failed attempts keep completed batches without advancing the history cursor.
 - Shared body downloads for simultaneous requests for the same message, cached envelope headers, and header searches that avoid downloading bodies when possible.
 - SMTP envelope recipients mapped to Gmail's header-based recipient model, including Bcc. MIME bodies are preserved.
 
@@ -89,9 +89,39 @@ Use `serve --read-concurrency 6` to set 1–16 metadata workers. For `gws`, the 
 
 `serve`, `probe`, and `install-agent` default to `--quota-profile current`: 80 quota units/s with the newer method costs. The LaunchAgent saves that choice in its arguments. `--quota-profile legacy` uses 125 units/s and the older costs; use it only after verifying that the approved Google Cloud project retains both the legacy costs and limits. Increasing worker count cannot bypass the selected quota budget.
 
-The first profile history ID is saved as a **pending cursor before listing**. INBOX IDs are ordered first, then the remainder of the mailbox is backfilled. The first small batch becomes visible promptly; subsequent checkpoints occur every 250 messages or 30 seconds. A restart validates the pending cursor and resumes unfinished IDs, preserving published UIDs/UIDVALIDITY. A hard kill can require refetching the current uncommitted batch, not the completed batches. Only a finished snapshot promotes the pending cursor to the normal history checkpoint. Subsequent history sync catches changes made during and between attempts. If the pending history has expired, a new full snapshot starts while cached mail remains visible.
+### Refresh and performance settings
 
-Metadata reads with HTTP 400 `invalidArgument`/`failedPrecondition`, HTTP 404, or malformed message responses are recorded and retried on subsequent syncs. A 404 also removes a previously cached message. Unclassified HTTP 400s, authorization/permission errors, CLI execution failures, and cancellations stop the attempt without discarding committed batches. Background retries back off from 2 to 60 seconds. This matters for an intermittent 400 that succeeds on a later attempt: it no longer forces a complete restart.
+All tuning flags are accepted by `serve` and `install-agent`; the installer writes every effective value into the LaunchAgent so it is preserved across restarts. `probe` uses the same request, retry, quota, and concurrency settings. For an existing service, rebuild the binary and rerun `install-agent` with the desired flags. An older installed plist keeps its explicit polling interval until reinstalled.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--sync-interval` | `5s` | History polling cadence; minimum `1s` |
+| `--label-interval` | `5m` | Folder creation, rename, and removal checks; minimum `1s` |
+| `--skipped-retry-interval` | `5m` | Retry skipped metadata independently of fast history polling; minimum `1s` |
+| `--read-concurrency` | `6` | Metadata workers / gws read subprocesses; `1`–`16` |
+| `--checkpoint-batch-size` | `250` | Results per durable metadata batch; `1`–`500` |
+| `--checkpoint-interval` | `5s` | Flush partial metadata batches during backfill; minimum `1s` |
+| `--quota-profile` | `current` | Method costs and automatic budget; `legacy` requires verified eligibility |
+| `--quota-units-per-second` | `0` | `0` selects profile default (`80` current, `125` legacy); explicit budget `1`–`100` current, `1`–`250` legacy |
+| `--read-retries` | `3` | Additional attempts for transient read errors; `0`–`10`; writes never retry |
+| `--retry-min-delay` | `1s` | Initial retry delay for API reads and failed background syncs |
+| `--retry-max-delay` | `1m` | Exponential backoff cap, up to `1h`; must be at least the minimum delay |
+| `--request-timeout` | `1m` | Deadline per HTTP request / gws subprocess, up to `10m`; queue, quota, and retry waits are excluded |
+
+```sh
+./bin/mailme serve --sync-interval 2s --label-interval 5m \
+  --quota-units-per-second 80 --read-concurrency 6
+./bin/mailme install-agent --sync-interval 2s --label-interval 5m \
+  --quota-units-per-second 80 --read-concurrency 6
+```
+
+Idle polling only requests history; unchanged labels do not rebuild the mailbox index. A changed history cursor is persisted separately from the index, and an unchanged cursor needs no disk write. Label refresh and skipped-message retries run on their own schedules. Messages mentioned in new history are always fetched immediately, including previously skipped IDs. These changes reduce local indexing and API overhead at short polling intervals. Polls run serially, measuring cadence from the start of each attempt; a slow attempt gets at least one second of rest before the next attempt rather than overlapping polls.
+
+Every request, including foreground body downloads and writes, shares the configured quota budget. A rate-limit response pauses the shared account queue, including requests already waiting. Queued requests remain paced when the cooldown ends, and canceled waiters do not consume future quota. Exponential retries add jitter; a server's `Retry-After` remains a minimum even when longer than `--retry-max-delay`. Faster polling does not raise the configured API budget. Lower it if other applications share the same account/project; increasing it requires sufficient available quota.
+
+The first profile history ID is saved as a **pending cursor before listing**. INBOX IDs are ordered first, then the remainder of the mailbox is backfilled. The first small batch becomes visible promptly; subsequent checkpoints occur every 250 messages or five seconds by default (both configurable). A restart validates the pending cursor and resumes unfinished IDs, preserving published UIDs/UIDVALIDITY. A hard kill can require refetching the current uncommitted batch, not the completed batches. Only a finished snapshot promotes the pending cursor to the normal history checkpoint. Subsequent history sync catches changes made during and between attempts. If the pending history has expired, a new full snapshot starts while cached mail remains visible.
+
+Metadata reads with HTTP 400 `invalidArgument`/`failedPrecondition`, HTTP 404, or malformed message responses are recorded and retried on the skipped-message schedule, or sooner when new history mentions them. A 404 also removes a previously cached message. Unclassified HTTP 400s, authorization/permission errors, CLI execution failures, and cancellations stop the attempt without discarding committed batches. Background retries use the configured exponential backoff with jitter. This matters for an intermittent 400 that succeeds on a later attempt: it no longer forces a complete restart.
 
 ### Large-mailbox timing
 
@@ -179,13 +209,13 @@ The cache is **not encrypted by the application**. Protect it using the Mac's no
 
 Google's May 2026 quota model allows 6,000 units per user per project per minute. Mailme's default `current` profile uses 80 units/s (4,800/minute), with costs of 20 for metadata reads, 60 for raw/full body reads, 20 for Trash, and 100 for sends. All foreground and background requests share that budget. Other applications using the same account/project can consume the remaining headroom. Google says qualifying older projects retain their previously set quotas; Mailme does not assume that exemption. See [Gmail quota costs and eligibility](https://developers.google.com/workspace/gmail/api/reference/quota).
 
-Reads retry 429, 5xx, and 403 `rateLimitExceeded`/`userRateLimitExceeded` with backoff. Direct HTTP honors `Retry-After`, including HTTP dates, capped at 60 seconds. The CLI backend honors a structured `retryAfter` when provided; gws 0.22.5 discards HTTP headers, so it uses backoff when that information is absent. See [Gmail error guidance](https://developers.google.com/workspace/gmail/api/guides/handle-errors).
+Reads retry 429, 5xx, and 403 `rateLimitExceeded`/`userRateLimitExceeded` with configurable backoff and jitter. Direct HTTP honors `Retry-After`, including HTTP dates, without shortening it to the backoff cap. The CLI backend honors a structured `retryAfter` when provided; gws 0.22.5 discards HTTP headers, so it uses backoff when that information is absent. Rate limits and retryable responses with a server cooldown pause all queued operations, including after retry exhaustion or a failed write; writes still never retry. See [Gmail error guidance](https://developers.google.com/workspace/gmail/api/guides/handle-errors).
 
 Mailme never automatically retries a write or reinvokes a failed send, including after a 401. If a send fails after Google may have accepted it, Mail receives an error asking you to check Gmail Sent before retrying. Exactly-once delivery cannot be guaranteed across an interrupted API response or a disconnected local SMTP client.
 
-The `gws` backend uses raw Discovery commands (`gmail users getProfile`, `labels list`, `messages list/get/modify/trash/untrash/send`, and `history list`) with `--params` and `--format json`. Sending requires `--upload` and `--upload-content-type message/rfc822`. Mailme manages pagination without the CLI's `--page-all` page limit. Commands have a one-minute deadline and bounded output; stderr stays discarded. Errors contain HTTP code, method, message ID, and sanitized machine status/reasons when present. They never include Google's free-form error message. gws 0.22.5 preserves only one flattened reason and omits `error.status` and additional reasons; Mailme cannot recover fields the CLI has discarded. See the [0.22.5 executor](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/executor.rs).
+The `gws` backend uses raw Discovery commands (`gmail users getProfile`, `labels list`, `messages list/get/modify/trash/untrash/send`, and `history list`) with `--params` and `--format json`. Sending requires `--upload` and `--upload-content-type message/rfc822`. Mailme manages pagination without the CLI's `--page-all` page limit. Commands have a configurable deadline (one minute by default) and bounded output; stderr stays discarded. Errors contain HTTP code, method, message ID, and sanitized machine status/reasons when present. They never include Google's free-form error message. gws 0.22.5 preserves only one flattened reason and omits `error.status` and additional reasons; Mailme cannot recover fields the CLI has discarded. See the [0.22.5 executor](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/executor.rs).
 
-gws 0.22.5 [reads cached tokens and refreshes when needed](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/auth.rs); its [encrypted cache uses atomic writes and an in-process mutex](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/token_storage.rs). Mailme runs one profile probe before fanning out reads. On simultaneous 401s, it drains active calls, runs one shared recovery probe, and retries only reads once if that probe succeeds. A persistent 401 requires `gws auth login`; Mailme does not force refresh, export tokens, inspect encrypted credentials, or coordinate other independently running gws processes. The proxy authentication path differs upstream; use `--read-concurrency 1` to diagnose environment-specific behavior.
+gws 0.22.5 [reads cached tokens and refreshes when needed](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/auth.rs); its [encrypted cache uses atomic writes and an in-process mutex](https://github.com/googleworkspace/cli/blob/v0.22.5/crates/google-workspace-cli/src/token_storage.rs). Mailme runs one profile probe before fanning out reads. On simultaneous 401s, it drains active calls, runs one shared recovery probe, and retries only reads once if that probe succeeds and the configured read-retry budget permits it. `--read-retries 0` also disables this read replay. A persistent 401 requires `gws auth login`; Mailme does not force refresh, export tokens, inspect encrypted credentials, or coordinate other independently running gws processes. The proxy authentication path differs upstream; use `--read-concurrency 1` to diagnose environment-specific behavior.
 
 State locks protect snapshots and short commits only; no Gmail or client response I/O runs under the global state lock. Complete local mutation commands remain ordered by a separate mutex. Per-message versions prevent an overlapping metadata read from overwriting a committed mutation; those IDs are reconciled again later. Search uses a command snapshot, and pending mailbox updates preserve client sequence-number mapping. Mutation responses never advance the history cursor. New UIDs append as batches arrive, so backfilling an older message does not renumber existing mail.
 
@@ -198,7 +228,7 @@ If Google blocks authorization, use the organization's app approval process. If 
 - No offline write queue. Cached mail remains usable during sync failures; uncached bodies and writes require Google access. Fresh caches may initially show empty or partial folders.
 - A simple in-memory metadata index is persisted transactionally. Each checkpoint rewrites that index; very large mailboxes can still spend time in local commits. Long commands no longer block other sessions on network I/O, but each IMAP connection processes its own command stream in order.
 - Gmail changes appear on the polling interval, plus API processing time. No Cloud Pub/Sub setup is required.
-- The `gws` backend still starts one subprocess per request. New arrivals outside the initial listing are caught by history sync after backfill finishes. Persistently skipped IDs are retried each sync, which can add load if there are many of them.
+- The `gws` backend still starts one subprocess per request. New arrivals outside the initial listing are caught by history sync after backfill finishes. Persistently skipped IDs are retried on a separate configurable schedule; a large skipped set can still extend that attempt.
 - The IMAP dependency is pinned to a v2 beta. Automated protocol coverage does not establish full Apple Mail compatibility; finish the manual checklist below before relying on this for daily work.
 
 ## Validation
@@ -211,13 +241,14 @@ go vet ./...
 go build -o bin/mailme ./cmd/mailme
 ```
 
-Tests use synthetic messages, a simulated CLI, a mock Keychain, and temporary local TLS/HTTP listeners. They do not require `gws`, access real Keychain secrets, authenticate to Google, send real email, change certificate trust, or run the LaunchAgent installer. In addition to protocol/MIME/OAuth coverage, they exercise a real SIGKILL and checkpoint resume, pending cursor expiry/promotion, skipped-ID retries, stable late-arrival UIDs, immediate partial mailbox access, nonblocking SELECT/NOOP during sync/FETCH/SEARCH/mutations, stale-read protection, body single-flight, 403 retries, bounded CLI concurrency, one 401 recovery probe, and clipboard-only password display.
+Tests use synthetic messages, a simulated CLI, a mock Keychain, and temporary local TLS/HTTP listeners. They do not require `gws`, access real Keychain secrets, authenticate to Google, send real email, change certificate trust, or run the LaunchAgent installer. In addition to protocol/MIME/OAuth coverage, they exercise a real SIGKILL and checkpoint resume, pending cursor expiry/promotion, skipped-ID retries, stable late-arrival UIDs, immediate partial mailbox access, nonblocking SELECT/NOOP during sync/FETCH/SEARCH/mutations, stale-read protection, body single-flight, 403 retries, bounded CLI concurrency, one 401 recovery probe, and clipboard-only password display. Runtime tuning tests cover shared cooldowns, cancellation without quota debt, retry exhaustion and zero retries, per-attempt deadlines, unchanged-index/cursor persistence, independent refresh schedules, checkpoint timing, and complete LaunchAgent argument preservation.
 
 Reproduce the synthetic throughput and 16,650-message index/persistence checks (no real account):
 
 ```sh
 MAILME_BENCHMARK=1 go test ./internal/gws -run '^TestSimulatedThroughput$' -v -count=1
 MAILME_BENCHMARK=1 go test ./internal/bridge -run '^TestLargeMailboxBackfill$' -v -count=1
+go test ./internal/bridge -run '^$' -bench '^BenchmarkIdleSync$' -benchtime=100x -benchmem
 ```
 
 ### Read-only live diagnosis

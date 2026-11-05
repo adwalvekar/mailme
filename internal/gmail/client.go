@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -51,11 +50,16 @@ type Client struct {
 	BaseURL      string // Override only in tests.
 	Email        string
 	QuotaProfile string // empty means current; set before making any requests
-	writeMu      sync.Mutex
+	Policy       *RequestPolicy
+	writeMu      WriteGate
 	pace         Pacer
 }
 
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
+	policy := DefaultRequestPolicy()
+	if c.Policy != nil {
+		policy = *c.Policy
+	}
 	base := c.BaseURL
 	if base == "" {
 		base = Endpoint
@@ -64,7 +68,9 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		}
 	}
 	if method != http.MethodGet {
-		c.writeMu.Lock()
+		if err := c.writeMu.Lock(ctx); err != nil {
+			return err
+		}
 		defer c.writeMu.Unlock()
 	}
 	apiMethod, id := requestIdentity(path)
@@ -81,11 +87,13 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	// Pace requests below Gmail's per-user quota. Only GET requests are retried;
 	// an ambiguous send outcome must never cause an automatic duplicate send.
 	for attempt := 0; ; attempt++ {
-		if err := c.pace.Wait(ctx, Cost(apiMethod, values.Get("format"), c.QuotaProfile), c.QuotaProfile); err != nil {
+		if err := c.pace.Wait(ctx, Cost(apiMethod, values.Get("format"), c.QuotaProfile), c.QuotaProfile, policy.Rate(c.QuotaProfile)); err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
+		requestCtx, cancel := context.WithTimeout(ctx, policy.RequestTimeout)
+		req, err := http.NewRequestWithContext(requestCtx, method, base+path, bytes.NewReader(body))
 		if err != nil {
+			cancel()
 			return err
 		}
 		if in != nil {
@@ -93,8 +101,13 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		}
 		res, err := c.HTTP.Do(req)
 		if err != nil {
+			requestErr := requestCtx.Err()
+			cancel()
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if requestErr != nil {
+				return requestErr
 			}
 			return errors.New("Gmail API transport failed method=" + apiMethod + " id=" + SafeIdentifier(id))
 		}
@@ -103,9 +116,14 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 				err = json.NewDecoder(io.LimitReader(res.Body, 64<<20)).Decode(out)
 			}
 			res.Body.Close()
+			requestErr := requestCtx.Err()
+			cancel()
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
+				}
+				if requestErr != nil {
+					return requestErr
 				}
 				if apiMethod == "messages.get" {
 					return &MalformedMessageError{ID: id}
@@ -117,14 +135,15 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		data, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 		apiErr := ParseAPIError(data, res.StatusCode)
 		apiErr.Method, apiErr.ID = apiMethod, id
-		apiErr.RetryAfter = RetryDelay(res.Header.Get("Retry-After"), time.Now())
+		apiErr.RetryAfter = max(apiErr.RetryAfter, RetryDelay(res.Header.Get("Retry-After"), time.Now()))
 		res.Body.Close()
-		if method != http.MethodGet || attempt >= 3 || !Retryable(apiErr) {
-			return apiErr
+		cancel()
+		delay := policy.Delay(attempt, apiErr)
+		if RateLimited(apiErr) || Retryable(apiErr) && apiErr.RetryAfter > 0 {
+			c.pace.Pause(delay)
 		}
-		delay := time.Second << attempt
-		if apiErr.RetryAfter > delay {
-			delay = apiErr.RetryAfter
+		if method != http.MethodGet || attempt >= policy.ReadRetries || !Retryable(apiErr) {
+			return apiErr
 		}
 		if err := wait(ctx, delay); err != nil {
 			return err

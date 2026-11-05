@@ -58,17 +58,17 @@ func (c *Client) probeAuth(ctx context.Context) (uint64, error) {
 	var profile gmail.Profile
 	var err error
 	for attempt := 0; ; attempt++ {
-		err = c.pace.Wait(ctx, gmail.Cost("getProfile", "", c.quotaProfile), c.quotaProfile)
+		err = c.pace.Wait(ctx, gmail.Cost("getProfile", "", c.quotaProfile), c.quotaProfile, c.policy.Rate(c.quotaProfile))
 		if err == nil {
 			err = c.invoke(ctx, []string{"gmail", "users", "getProfile", "--params", string(params), "--format", "json"}, &profile)
 		}
-		if !gmail.Retryable(err) || attempt >= 3 {
-			break
-		}
-		delay := time.Second << attempt
+		delay := c.policy.Delay(attempt, err)
 		var apiErr *gmail.APIError
-		if errors.As(err, &apiErr) && apiErr.RetryAfter > delay {
-			delay = apiErr.RetryAfter
+		if gmail.RateLimited(err) || gmail.Retryable(err) && errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+			c.pace.Pause(delay)
+		}
+		if !gmail.Retryable(err) || attempt >= c.policy.ReadRetries {
+			break
 		}
 		if err = wait(ctx, delay); err != nil {
 			break
