@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mailme/internal/gmail"
+	"mailme/internal/logging"
 )
 
 type Runtime struct {
@@ -19,6 +20,7 @@ type Runtime struct {
 	ReadConcurrency      int
 	QuotaProfile         string
 	Request              gmail.RequestPolicy
+	Logs                 logging.Options
 }
 
 func Default() Runtime {
@@ -26,11 +28,19 @@ func Default() Runtime {
 		SyncInterval: 5 * time.Second, LabelInterval: 5 * time.Minute,
 		SkippedRetryInterval: 5 * time.Minute, CheckpointInterval: 5 * time.Second,
 		CheckpointBatchSize: 250, ReadConcurrency: 6, QuotaProfile: "current",
-		Request: gmail.DefaultRequestPolicy(),
+		Request: gmail.DefaultRequestPolicy(), Logs: logging.Default(),
 	}
 }
 
 func (r *Runtime) Flags(f *flag.FlagSet) {
+	f.StringVar(&r.Logs.File, "log-file", r.Logs.File, "Persistent log file (default: ~/Library/Logs/mailme/bridge.log on macOS)")
+	f.IntVar(&r.Logs.MaxSizeMB, "log-max-size", r.Logs.MaxSizeMB, "Rotate the active log at this many MiB (1–1024)")
+	f.IntVar(&r.Logs.MaxBackups, "log-max-backups", r.Logs.MaxBackups, "Maximum rotated log files to retain (1–100)")
+	f.IntVar(&r.Logs.MaxAgeDays, "log-max-age", r.Logs.MaxAgeDays, "Retain rotated logs for this many days (0 disables age expiry; count still bounded)")
+	f.BoolVar(&r.Logs.Compress, "log-compress", r.Logs.Compress, "Compress rotated logs with gzip")
+	f.StringVar(&r.Logs.Level, "log-level", r.Logs.Level, "Minimum log severity: debug, info, warn, error")
+	f.StringVar(&r.Logs.Format, "log-format", r.Logs.Format, "Log format: text or json")
+	f.BoolVar(&r.Logs.Stderr, "log-stderr", r.Logs.Stderr, "Also mirror application logs to stderr")
 	f.DurationVar(&r.SyncInterval, "sync-interval", r.SyncInterval, "Gmail history polling interval (minimum 1s)")
 	f.DurationVar(&r.LabelInterval, "label-interval", r.LabelInterval, "Folder definition refresh interval (minimum 1s)")
 	f.DurationVar(&r.SkippedRetryInterval, "skipped-retry-interval", r.SkippedRetryInterval, "Retry interval for skipped metadata IDs (minimum 1s)")
@@ -46,6 +56,9 @@ func (r *Runtime) Flags(f *flag.FlagSet) {
 }
 
 func (r Runtime) Validate() error {
+	if err := r.Logs.Validate(); err != nil {
+		return err
+	}
 	for _, item := range []struct {
 		name  string
 		value time.Duration
@@ -70,6 +83,10 @@ func (r Runtime) Validate() error {
 // retries and a profile's automatic quota budget.
 func (r Runtime) Args() []string {
 	return []string{
+		"--log-file", r.Logs.File, "--log-max-size", strconv.Itoa(r.Logs.MaxSizeMB),
+		"--log-max-backups", strconv.Itoa(r.Logs.MaxBackups), "--log-max-age", strconv.Itoa(r.Logs.MaxAgeDays),
+		"--log-compress=" + strconv.FormatBool(r.Logs.Compress), "--log-stderr=" + strconv.FormatBool(r.Logs.Stderr),
+		"--log-level", r.Logs.Level, "--log-format", r.Logs.Format,
 		"--sync-interval", r.SyncInterval.String(), "--label-interval", r.LabelInterval.String(),
 		"--skipped-retry-interval", r.SkippedRetryInterval.String(), "--checkpoint-interval", r.CheckpointInterval.String(),
 		"--checkpoint-batch-size", strconv.Itoa(r.CheckpointBatchSize), "--read-concurrency", strconv.Itoa(r.ReadConcurrency),

@@ -3,7 +3,7 @@ package bridge
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +37,7 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	if pending != nil {
 		_, _, err := b.api.Changes(ctx, pending.History)
 		if is404(err) {
-			log.Print("Pending Gmail history expired; restarting snapshot, retaining cached mail")
+			slog.Warn("Pending Gmail history expired; restarting snapshot, retaining cached mail")
 			if err := b.update(func(st *state) { st.Pending = nil }); err != nil {
 				return err
 			}
@@ -50,6 +50,7 @@ func (b *Bridge) Sync(ctx context.Context) error {
 		ids, cursor, err := b.api.Changes(ctx, history)
 		if err == nil {
 			retrySkipped := !time.Now().Before(b.nextSkipped)
+			slog.Debug("Gmail history checked", "changed_messages", len(ids), "retry_skipped", retrySkipped)
 			b.mu.Lock()
 			if retrySkipped {
 				for id := range b.state.Skipped {
@@ -91,7 +92,7 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	pending = b.state.Pending
 	b.mu.Unlock()
 	if !pending.Listed {
-		log.Print("Listing Gmail message IDs; INBOX will be fetched first")
+		slog.Info("Listing Gmail message IDs; INBOX will be fetched first")
 		var inbox []string
 		if priority, ok := b.api.(interface {
 			InboxIDs(context.Context) ([]string, error)
@@ -278,7 +279,7 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 		if rate > 0 {
 			eta = (time.Duration(float64(total-done)/rate) * time.Second).String()
 		}
-		log.Printf("Gmail sync: fetched=%d/%d rate=%.1f messages/s ETA=%s skipped=%d", done, total, rate, eta, skipped)
+		slog.Info("Gmail sync progress", "fetched", done, "total", total, "rate_messages_per_second", rate, "eta", eta, "skipped", skipped)
 	}
 	progress()
 	batch := make([]metadataResult, 0, b.batchSize)
@@ -344,7 +345,7 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 				continue
 			}
 			if result.err != nil {
-				log.Printf("Skipping Gmail message id=%s (will retry): %v", gmail.SafeIdentifier(result.id), result.err)
+				slog.Warn("Skipping Gmail message; will retry", "id", gmail.SafeIdentifier(result.id), "error", result.err)
 			}
 			batch = append(batch, result)
 			fetched++
@@ -380,7 +381,7 @@ func (b *Bridge) RunSync(ctx context.Context, interval time.Duration) {
 			}
 			delay = b.retryPolicy.Delay(attempt, err)
 			attempt = min(attempt+1, 63)
-			log.Printf("Gmail sync paused; cached mail remains available, retry in %s: %v", delay, err)
+			slog.Warn("Gmail sync paused; cached mail remains available", "retry_in", delay, "error", err)
 		} else {
 			attempt = 0
 		}

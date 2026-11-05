@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Replace every /ABSOLUTE/PATH placeholder before installing.
      launchd does not expand ~ or environment variables in these strings.
-     Create the log directory first. This template is not installed automatically.
+     Application logs rotate independently of launchd stdio.
+     This template is not installed automatically.
      For gws: login resolves the npm shim to its native executable. Reproduce any
      custom gws authentication/config environment used by your interactive shell. -->
 <plist version="1.0">
@@ -12,6 +13,7 @@
   <array>
     <string>/ABSOLUTE/PATH/mailme/bin/mailme</string>
     <string>serve</string>
+    <string>--foreground</string>
     <string>--data-dir</string>
     <string>/ABSOLUTE/PATH/Library/Application Support/mailme</string>
     <string>--read-concurrency</string><string>6</string>
@@ -26,11 +28,19 @@
     <string>--retry-min-delay</string><string>1s</string>
     <string>--retry-max-delay</string><string>1m0s</string>
     <string>--request-timeout</string><string>1m0s</string>
+    <string>--log-file</string><string>/ABSOLUTE/PATH/Library/Logs/mailme/bridge.log</string>
+    <string>--log-max-size</string><string>10</string>
+    <string>--log-max-backups</string><string>5</string>
+    <string>--log-max-age</string><string>7</string>
+    <string>--log-compress=true</string>
+    <string>--log-stderr=false</string>
+    <string>--log-level</string><string>info</string>
+    <string>--log-format</string><string>text</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme/bridge.log</string>
-  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/Library/Logs/mailme/bridge.log</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
 </dict>
 </plist>

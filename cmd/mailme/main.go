@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/mail"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"mailme/internal/gws"
 	"mailme/internal/launchagent"
 	"mailme/internal/localtls"
+	"mailme/internal/logging"
 	"mailme/internal/settings"
 )
 
@@ -43,7 +45,10 @@ func defaultDir() string {
 	}
 	return filepath.Join(dir, "mailme")
 }
-func run() error {
+
+var newServiceManager = launchagent.New
+
+func run() (runErr error) {
 	if len(os.Args) < 2 {
 		usage()
 		return nil
@@ -57,6 +62,9 @@ func run() error {
 	gwsPath := f.String("gws-path", "gws", "Installed gws executable (login --backend gws)")
 	tuning := settings.Default()
 	tuning.Flags(f)
+	foreground := f.Bool("foreground", false, "Run serve in this process instead of the default macOS background service")
+	follow := f.Bool("follow", false, "Follow the active log across rotation (logs)")
+	lines := f.Int("lines", 100, "Recent lines to show (logs; 1–10000)")
 	copyPassword := f.Bool("copy-password", false, "Copy the local password with pbcopy instead of printing it (settings)")
 	probeID := f.String("message-id", "", "Probe one Gmail message ID (read-only probe)")
 	probeStart := f.Int("start", 0, "First sorted message index (read-only probe)")
@@ -73,22 +81,70 @@ func run() error {
 	if f.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
 	}
+	logFileExplicit := false
+	f.Visit(func(value *flag.Flag) {
+		if value.Name == "log-file" {
+			logFileExplicit = true
+		}
+	})
+	var err error
+	if tuning.Logs.File == "" {
+		tuning.Logs.File, err = logging.DefaultPath()
+	} else {
+		tuning.Logs.File, err = filepath.Abs(tuning.Logs.File)
+	}
+	if err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := tuning.Validate(); err != nil {
 		return err
 	}
+	// Older installed plists do not pass --foreground. Avoid asking launchd to
+	// unload/reinstall our own running job when such a service starts this binary.
+	managed := os.Getenv("XPC_SERVICE_NAME") == launchagent.Label
+	if managed {
+		tuning.Logs.Stderr = false
+	}
+	if command == "serve" && !*foreground && !managed {
+		command = "start"
+	}
 	switch command {
-	case "install-agent", "uninstall-agent":
+	case "install-agent", "uninstall-agent", "start", "stop", "status":
 		if runtime.GOOS != "darwin" {
-			return fmt.Errorf("LaunchAgents require macOS")
+			return fmt.Errorf("background service control requires macOS; use `mailme serve --foreground` under another service manager")
 		}
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return err
 		}
+		manager := newServiceManager(home)
 		if command == "uninstall-agent" {
-			return launchagent.Uninstall(ctx, home)
+			return manager.Uninstall(ctx)
+		}
+		if command == "stop" {
+			if err := manager.Stop(ctx); err != nil {
+				return err
+			}
+			fmt.Println("Stopped the background service. It will start again at login; uninstall-agent removes auto-start.")
+			return nil
+		}
+		if command == "status" {
+			status, err := manager.Status(ctx)
+			if err != nil {
+				return err
+			}
+			if !logFileExplicit {
+				if saved, err := manager.LogPath(); err == nil && saved != "" {
+					tuning.Logs.File = saved
+				}
+			}
+			fmt.Printf("Installed: %t\nLoaded: %t\nState: %s\nPID: %d\nLogs: %s\n", status.Installed, status.Loaded, status.State, status.PID, tuning.Logs.File)
+			if status.LastExit != nil {
+				fmt.Printf("Last exit code: %d\n", *status.LastExit)
+			}
+			return nil
 		}
 		if _, err := auth.Load(*dir); err != nil {
 			return fmt.Errorf("run login first: %w", err)
@@ -101,11 +157,23 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		path, err := launchagent.Install(ctx, home, binary, dataDir, *imapAddr, *smtpAddr, tuning)
+		path, err := manager.Start(ctx, binary, dataDir, *imapAddr, *smtpAddr, tuning, command == "install-agent")
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Installed %s\nLogs: %s\n", path, filepath.Join(home, "Library", "Logs", "mailme", "bridge.log"))
+		fmt.Printf("Background service loaded: %s\nLogs: %s\nUse `mailme status`, `mailme logs --follow`, or `mailme stop`.\n", path, tuning.Logs.File)
+		return nil
+	case "logs":
+		if !logFileExplicit && runtime.GOOS == "darwin" {
+			if home, err := os.UserHomeDir(); err == nil {
+				if saved, err := newServiceManager(home).LogPath(); err == nil && saved != "" {
+					tuning.Logs.File = saved
+				}
+			}
+		}
+		if err := logging.Tail(ctx, tuning.Logs.File, os.Stdout, *lines, *follow); err != nil {
+			return fmt.Errorf("read application log (start the service first or set --log-file): %w", err)
+		}
 		return nil
 	case "probe":
 		if *probeStart < 0 || *probeCount < 1 {
@@ -185,6 +253,26 @@ func run() error {
 		fmt.Printf("Apple Mail: Other Mail Account (IMAP)\nEmail / username: %s\nLocal bridge password: %s\nIncoming server: %s (TLS)\nOutgoing server: %s (TLS, Password authentication)\nCertificate to trust: %s\nDrafts and client-saved Sent: On My Mac\nDisable automatic connection settings; select the ports shown above.\n", c.Email, password, *imapAddr, *smtpAddr, filepath.Join(*dir, "localhost.crt"))
 		return nil
 	case "serve":
+		logs, err := logging.Open(tuning.Logs, os.Stderr)
+		if err != nil {
+			return fmt.Errorf("open application log: %w", err)
+		}
+		previous, previousWriter, previousFlags := slog.Default(), log.Writer(), log.Flags()
+		slog.SetDefault(logs.Logger)
+		defer func() {
+			if runErr != nil {
+				slog.Error("Bridge stopped", "error", runErr)
+			} else {
+				slog.Info("Bridge stopped")
+			}
+			slog.SetDefault(previous)
+			log.SetOutput(previousWriter)
+			log.SetFlags(previousFlags)
+			if err := logs.Close(); runErr == nil {
+				runErr = err
+			}
+		}()
+		slog.Info("Starting bridge", "log_file", tuning.Logs.File)
 		c, err := auth.Load(*dir)
 		if err != nil {
 			return fmt.Errorf("run login first: %w", err)
@@ -223,8 +311,10 @@ func run() error {
 		defer smtpLn.Close()
 		im := imapserver.New(&imapserver.Options{NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return b.NewSession(), nil, nil
-		}, Caps: imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapIdle: {}, imap.CapSpecialUse: {}, imap.CapUnselect: {}}, TLSConfig: tlsConfig})
+		}, Caps: imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapIdle: {}, imap.CapSpecialUse: {}, imap.CapUnselect: {}}, TLSConfig: tlsConfig,
+			Logger: slog.NewLogLogger(slog.Default().With("component", "imap").Handler(), slog.LevelError)})
 		sm := smtp.NewServer(b.SMTPBackend())
+		sm.ErrorLog = slog.NewLogLogger(slog.Default().With("component", "smtp").Handler(), slog.LevelError)
 		sm.Domain = "localhost"
 		sm.MaxMessageBytes = bridge.MaxMessageBytes
 		sm.MaxRecipients = 100
@@ -237,7 +327,7 @@ func run() error {
 		errors := make(chan error, 2)
 		go func() { errors <- im.Serve(imapLn) }()
 		go func() { errors <- sm.Serve(smtpLn) }()
-		log.Printf("Ready: IMAP TLS %s; SMTP TLS %s; serving cached/partial mail while Gmail sync runs (%d readers, %s quota, %d units/s, refresh=%s)", *imapAddr, *smtpAddr, tuning.ReadConcurrency, tuning.QuotaProfile, tuning.Request.Rate(tuning.QuotaProfile), tuning.SyncInterval)
+		slog.Info("Bridge ready; serving cached/partial mail while Gmail sync runs", "imap", *imapAddr, "smtp", *smtpAddr, "readers", tuning.ReadConcurrency, "quota_profile", tuning.QuotaProfile, "quota_units_per_second", tuning.Request.Rate(tuning.QuotaProfile), "refresh", tuning.SyncInterval)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -330,7 +420,11 @@ func usage() {
 Commands:
   login     Connect an authenticated gws CLI or a Google Desktop OAuth app
   settings  Show Apple Mail setup; --copy-password avoids printing the password
-  serve     Synchronize Gmail and serve IMAP + SMTP over TLS on loopback
+  serve     Start the macOS background service (use --foreground for terminal operation)
+  start     Alias for starting the macOS background service
+  stop      Stop the background service; keep its login auto-start definition
+  status    Show background service state and the log location
+  logs      Show recent logs; --follow streams across rotation
   probe     Read-only metadata diagnostic and throughput measurement
   install-agent    Install and load the per-user macOS LaunchAgent
   uninstall-agent  Unload and remove the LaunchAgent (keeps mail data)
