@@ -10,12 +10,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+
+	"mailme/internal/settings"
 )
 
 const Label = "com.mailme.bridge"
 
 // Render is pure: tests can verify the plan without invoking launchctl.
-func Render(binary, dataDir, logPath, imap, smtp, interval, quotaProfile string, concurrency int) ([]byte, error) {
+func Render(binary, dataDir, logPath, imap, smtp string, tuning settings.Runtime) ([]byte, error) {
+	if err := tuning.Validate(); err != nil {
+		return nil, err
+	}
 	for _, path := range []string{binary, dataDir, logPath} {
 		if !filepath.IsAbs(path) {
 			return nil, fmt.Errorf("LaunchAgent paths must be absolute")
@@ -32,7 +37,8 @@ func Render(binary, dataDir, logPath, imap, smtp, interval, quotaProfile string,
 	value("string", Label)
 	value("key", "ProgramArguments")
 	b.WriteString("<array>\n")
-	for _, arg := range []string{binary, "serve", "--data-dir", dataDir, "--imap", imap, "--smtp", smtp, "--sync-interval", interval, "--quota-profile", quotaProfile, "--read-concurrency", strconv.Itoa(concurrency)} {
+	args := append([]string{binary, "serve", "--data-dir", dataDir, "--imap", imap, "--smtp", smtp}, tuning.Args()...)
+	for _, arg := range args {
 		value("string", arg)
 	}
 	b.WriteString("</array>\n")
@@ -54,10 +60,10 @@ func location(home string) string {
 	return filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
 }
 
-func Install(ctx context.Context, home, binary, dataDir, imap, smtp, interval, quotaProfile string, concurrency int) (string, error) {
+func Install(ctx context.Context, home, binary, dataDir, imap, smtp string, tuning settings.Runtime) (string, error) {
 	logDir := filepath.Join(home, "Library", "Logs", "mailme")
 	path := location(home)
-	data, err := Render(binary, dataDir, filepath.Join(logDir, "bridge.log"), imap, smtp, interval, quotaProfile, concurrency)
+	data, err := Render(binary, dataDir, filepath.Join(logDir, "bridge.log"), imap, smtp, tuning)
 	if err != nil {
 		return "", err
 	}

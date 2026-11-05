@@ -72,6 +72,9 @@ func openDisk(dir, email string) (*disk, *state, error) {
 				return e
 			}
 		}
+		if cursor := b.Get([]byte("history")); cursor != nil {
+			st.History = string(cursor)
+		}
 		_, e = tx.CreateBucketIfNotExists([]byte("raw"))
 		return e
 	})
@@ -99,6 +102,9 @@ func (d *disk) save(st *state) error {
 		if err := tx.Bucket([]byte("state")).Put([]byte("index"), data); err != nil {
 			return err
 		}
+		if err := tx.Bucket([]byte("state")).Put([]byte("history"), []byte(st.History)); err != nil {
+			return err
+		}
 		c := tx.Bucket([]byte("raw")).Cursor()
 		for k, _ := c.First(); k != nil; k, _ = c.Next() {
 			if st.Messages[string(k)] == nil {
@@ -108,6 +114,14 @@ func (d *disk) save(st *state) error {
 			}
 		}
 		return nil
+	})
+}
+
+// History-only polls avoid serializing, reconciling, or rewriting the index.
+// Every full save updates this key in the same transaction as the index.
+func (d *disk) saveHistory(cursor string) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("state")).Put([]byte("history"), []byte(cursor))
 	})
 }
 func (d *disk) raw(id string) ([]byte, error) {

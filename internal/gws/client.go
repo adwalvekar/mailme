@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"mailme/internal/gmail"
@@ -20,8 +19,9 @@ import (
 type Client struct {
 	path, email  string
 	quotaProfile string
+	policy       gmail.RequestPolicy
 	gate         chan struct{}
-	writeMu      sync.Mutex
+	writeMu      gmail.WriteGate
 	pace         gmail.Pacer
 	authMu       authBarrier
 	authReady    bool
@@ -56,7 +56,7 @@ func New(path, email string, concurrency ...int) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{path: resolved, email: email, gate: make(chan struct{}, n)}, nil
+	return &Client{path: resolved, email: email, gate: make(chan struct{}, n), policy: gmail.DefaultRequestPolicy()}, nil
 }
 
 func (c *Client) Path() string { return c.path }
@@ -70,13 +70,26 @@ func (c *Client) SetQuotaProfile(profile string) error {
 	return nil
 }
 
+// SetRequestPolicy must be called after SetQuotaProfile, before any requests.
+func (c *Client) SetRequestPolicy(policy gmail.RequestPolicy) error {
+	profile := c.quotaProfile
+	if profile == "" {
+		profile = "current"
+	}
+	if err := policy.Validate(profile); err != nil {
+		return err
+	}
+	c.policy = policy
+	return nil
+}
+
 func (c *Client) call(ctx context.Context, resource, method string, params map[string]any, body any, upload string, read bool, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
 	// Bound all reads, including foreground body requests, with one shared pool.
 	// Mutations are serialized and are never re-invoked, even after a 401.
 	if !read {
-		c.writeMu.Lock()
+		if err := c.writeMu.Lock(ctx); err != nil {
+			return err
+		}
 		defer c.writeMu.Unlock()
 	}
 	select {
@@ -122,7 +135,7 @@ func (c *Client) call(ctx context.Context, resource, method string, params map[s
 	}
 	authRetried := false
 	for attempt := 0; ; attempt++ {
-		if err := c.pace.Wait(ctx, gmail.Cost(methodName, format, c.quotaProfile), c.quotaProfile); err != nil {
+		if err := c.pace.Wait(ctx, gmail.Cost(methodName, format, c.quotaProfile), c.quotaProfile, c.policy.Rate(c.quotaProfile)); err != nil {
 			return err
 		}
 		if err := c.authMu.lock(ctx, false); err != nil {
@@ -137,7 +150,8 @@ func (c *Client) call(ctx context.Context, resource, method string, params map[s
 				c.invalidateAuth(epoch)
 				return err
 			}
-			if authRetried {
+			if authRetried || attempt >= c.policy.ReadRetries {
+				c.invalidateAuth(epoch)
 				return err
 			}
 			authRetried = true
@@ -148,12 +162,12 @@ func (c *Client) call(ctx context.Context, resource, method string, params map[s
 			}
 			continue
 		}
-		if !read || attempt >= 3 || !gmail.Retryable(err) {
-			return err
+		delay := c.policy.Delay(attempt, err)
+		if gmail.RateLimited(err) || gmail.Retryable(err) && apiErr != nil && apiErr.RetryAfter > 0 {
+			c.pace.Pause(delay)
 		}
-		delay := time.Second << attempt
-		if apiErr != nil && apiErr.RetryAfter > delay {
-			delay = apiErr.RetryAfter
+		if !read || attempt >= c.policy.ReadRetries || !gmail.Retryable(err) {
+			return err
 		}
 		if err := wait(ctx, delay); err != nil {
 			return err

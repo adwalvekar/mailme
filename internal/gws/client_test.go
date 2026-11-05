@@ -91,6 +91,10 @@ func TestGWSHelperProcess(t *testing.T) {
 		}
 	}
 	switch scenario {
+	case "cooldown":
+		if len(previous) == 0 {
+			emit(`{"error":{"code":429,"retryAfter":"120"}}`, 1)
+		}
 	case "rate-limit":
 		if len(previous) == 0 {
 			emit(`{"error":{"code":403,"status":"RESOURCE_EXHAUSTED","errors":[{"reason":"userRateLimitExceeded"}],"message":"PRIVATE TOKEN"}}`, 1)
