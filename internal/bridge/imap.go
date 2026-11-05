@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"log"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +34,7 @@ func protocolError(err error) error {
 	if err == nil {
 		return nil
 	}
-	log.Printf("Mail operation failed: %v", err)
+	slog.Error("Mail operation failed", "error", err)
 	return no("Gmail/cache operation failed; retry after checking bridge logs")
 }
 func (s *Session) Login(user, password string) error {

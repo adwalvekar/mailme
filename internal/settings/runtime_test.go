@@ -15,6 +15,8 @@ func TestRuntimeSettingsRoundTripAndValidation(t *testing.T) {
 		"--checkpoint-interval", "2s", "--checkpoint-batch-size", "80", "--read-concurrency", "12",
 		"--quota-profile", "legacy", "--quota-units-per-second", "200", "--read-retries", "0",
 		"--retry-min-delay", "2s", "--retry-max-delay", "30s", "--request-timeout", "2m",
+		"--log-file", "/private/logs/bridge.log", "--log-max-size", "2", "--log-max-backups", "3", "--log-max-age", "0",
+		"--log-compress=false", "--log-stderr=false", "--log-level", "warn", "--log-format", "json",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -36,6 +38,8 @@ func TestRuntimeSettingsRoundTripAndValidation(t *testing.T) {
 		{"--read-concurrency", "0"}, {"--checkpoint-batch-size", "501"},
 		{"--quota-profile", "typo"}, {"--quota-units-per-second", "101"}, {"--quota-units-per-second", "-1"},
 		{"--read-retries", "-1"}, {"--retry-min-delay", "2m"}, {"--request-timeout", "0s"},
+		{"--log-max-size", "0"}, {"--log-max-backups", "0"}, {"--log-max-age", "-1"},
+		{"--log-level", "trace"}, {"--log-format", "xml"},
 	} {
 		r := Default()
 		f := flag.NewFlagSet("serve", flag.ContinueOnError)

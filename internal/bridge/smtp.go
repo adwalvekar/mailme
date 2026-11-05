@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/mail"
 	"strings"
 	"time"
@@ -89,7 +89,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 	s.b.mutations.Lock()
 	defer s.b.mutations.Unlock()
 	if err = s.b.api.Send(ctx, raw); err != nil {
-		log.Printf("Gmail send failed (not retried by bridge): %v", err)
+		slog.Error("Gmail send failed; check Sent before retrying", "error", err)
 		// A transport failure can occur after Google accepts mail. A permanent
 		// response prevents a client from silently retrying an ambiguous send.
 		return smtpError(554, "Gmail did not confirm delivery. Check Gmail Sent before manually retrying")

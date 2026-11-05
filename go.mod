@@ -10,6 +10,7 @@ require (
 	github.com/zalando/go-keyring v0.2.6
 	go.etcd.io/bbolt v1.4.0
 	golang.org/x/oauth2 v0.28.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

@@ -42,6 +42,8 @@ go build -o bin/mailme ./cmd/mailme
 ./bin/mailme serve
 ```
 
+On macOS, `serve` installs/starts a per-user background service and returns to the terminal. It starts again at login and launchd restarts it after a crash. Use `serve --foreground` for an interactive session or under a different service manager.
+
 `login --backend gws` checks your Gmail profile through the CLI, saves the selected backend and absolute executable path, and creates the local bridge password and TLS identity. It does not install `gws`, open an OAuth consent page, export CLI tokens, or send email. To select a particular installation, add `--gws-path /absolute/path/to/gws` to `login`. An npm `@googleworkspace/cli` Node shim is resolved to its installed native `bin/gws`, so launchd does not need nvm's `node` on PATH. An unresolved Node shim produces an actionable error. `serve` uses the saved backend; it does not fall back to direct OAuth.
 
 The CLI's existing authorization needs `https://www.googleapis.com/auth/gmail.modify` (or equivalent Gmail permissions for all operations), covering reading, sending, changing labels, and Trash. Approval of the app alone does not grant these permissions. The login profile check verifies the account and read access; it does **not** exercise sending or modification permissions. Resolve missing access through your organization's approved `gws` authentication process. Mailme does not change CLI credentials or request new CLI scopes. See [Google's scope reference](https://developers.google.com/workspace/gmail/api/auth/scopes).
@@ -83,11 +85,52 @@ To switch an existing account to `gws`, stop the bridge, run `login --backend gw
 
 The default data directory on macOS is `~/Library/Application Support/mailme`. To change it, pass the same `--data-dir /absolute/path` to every command. Custom ports are configured with `serve --imap 127.0.0.1:1993 --smtp 127.0.0.1:1465`; pass those flags to `settings` as well to display them. Only one process may open a data directory.
 
-Keep `serve` running while using Mail. TLS handshakes, authentication, and the cached/partial mailbox view are available immediately, even when Google is offline. Startup no longer binds sockets and waits for synchronization before serving them. Metadata listing and backfill run in the background; message bodies are downloaded and cached on demand. Apple Mail may fetch many of them immediately.
+`serve` starts the macOS background service by default, using the saved account and the current executable's absolute path. The terminal can then be closed. Repeating the same command with unchanged settings keeps an already loaded service running; changing settings reloads it. `start` is an alias. `install-agent` explicitly reinstalls/reloads the service even when its settings are unchanged. Keep the binary at the installed path.
+
+```sh
+./bin/mailme serve                 # start in the background and enable login auto-start
+./bin/mailme status                # installed/loaded state, PID, last exit code, log path
+./bin/mailme logs --lines 100       # recent application logs
+./bin/mailme logs --follow          # stream logs, following file rotation
+./bin/mailme stop                  # stop now; login auto-start remains configured
+./bin/mailme uninstall-agent       # stop and remove login auto-start
+./bin/mailme serve --foreground    # run in this terminal instead
+```
+
+Stop the background service before starting a foreground instance against the same data directory. On Linux or another service manager, use `serve --foreground`. The macOS service runs while your user is logged in; it does not require an open terminal and is not a system daemon that runs before login. See [Apple's guide to user agents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
+
+Loading the job is separate from the bridge becoming ready. Use `status` and `logs` to inspect startup errors; a loaded job can be waiting for launchd to restart it. TLS handshakes, authentication, and the cached/partial mailbox view become available without waiting for Gmail synchronization, even when Google is offline. Metadata listing and backfill run in the background; message bodies are downloaded and cached on demand. Apple Mail may fetch many of them immediately.
 
 Use `serve --read-concurrency 6` to set 1–16 metadata workers. For `gws`, the same limit covers all read subprocesses, including foreground body downloads. All requests share quota pacing; writes remain serialized. Counts, rate, ETA, and skipped count are logged at the start, roughly every 30 seconds during fetching, and at completion. Skipped message IDs and sanitized errors are logged without headers or content.
 
 `serve`, `probe`, and `install-agent` default to `--quota-profile current`: 80 quota units/s with the newer method costs. The LaunchAgent saves that choice in its arguments. `--quota-profile legacy` uses 125 units/s and the older costs; use it only after verifying that the approved Google Cloud project retains both the legacy costs and limits. Increasing worker count cannot bypass the selected quota budget.
+
+### Logs and retention
+
+Every foreground or background bridge writes persistent application logs to `~/Library/Logs/mailme/bridge.log` on macOS (`$XDG_CACHE_HOME/mailme/bridge.log`, or the normal user cache directory, on other systems). Application-owned rotation keeps the active filename stable and prevents an ever-growing launchd output file. New log directories use mode `0700`; active and rotated log files use `0600`. A small `.lock` file prevents two bridge processes from rotating the same log. Another account/foreground instance needs its own `--log-file` as well as its own data directory.
+
+The default active-file limit is **10 MiB**, with **five** compressed backups retained for up to **seven days**. Count and age cleanup run at startup and after rotation; backup age is measured from rotation time. Compression and cleanup happen in the background, so the retained-file count can briefly exceed its target during rotation. An oversized log from an older installation is archived on startup. Retention applies to rotated backups; an inactive current log is not deleted just because it is old.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--log-file` | Platform path above | Persistent active log; relative CLI paths are resolved to absolute paths |
+| `--log-max-size` | `10` | Active file limit in MiB; `1`–`1024` |
+| `--log-max-backups` | `5` | Retained backup count; `1`–`100` (always bounded) |
+| `--log-max-age` | `7` | Backup age in days; `0`–`365`; `0` disables age expiry while keeping the count limit |
+| `--log-compress` | `true` | Gzip rotated backups; use `--log-compress=false` to disable |
+| `--log-level` | `info` | Minimum severity: `debug`, `info`, `warn`, `error` |
+| `--log-format` | `text` | Structured `text` or newline-delimited `json` |
+| `--log-stderr` | `true` in foreground | Mirror to the terminal; background service disables this |
+
+```sh
+./bin/mailme serve --log-max-size 20 --log-max-backups 3 --log-max-age 14 --log-format json
+./bin/mailme logs --lines 200 --follow
+./bin/mailme serve --foreground --log-file /absolute/path/test-bridge.log --log-level debug
+```
+
+`logs` reads the active file without opening the mailbox or accessing Keychain. It shows the last 100 lines by default (up to 10,000 lines within the last 8 MiB) and follows filename changes after rotation. On macOS, it discovers a custom log path from the installed service; `--log-file` overrides that choice. Compressed historical backups remain available beside the active log. Shutdown and startup failures after log initialization are persisted. Mail contents, passwords, and OAuth tokens are not added to logs; `settings` output remains an explicit terminal-only command.
+
+Launchd stdout/stderr go to `/dev/null`; application logs, including IMAP/SMTP library error logs, go through the rotating writer. Errors before log initialization and raw runtime crash output are only visible in foreground stderr; use `serve --foreground` when a job exits before it can initialize logging. This avoids launchd retaining an old file descriptor across rotation.
 
 ### Refresh and performance settings
 
@@ -241,7 +284,7 @@ go vet ./...
 go build -o bin/mailme ./cmd/mailme
 ```
 
-Tests use synthetic messages, a simulated CLI, a mock Keychain, and temporary local TLS/HTTP listeners. They do not require `gws`, access real Keychain secrets, authenticate to Google, send real email, change certificate trust, or run the LaunchAgent installer. In addition to protocol/MIME/OAuth coverage, they exercise a real SIGKILL and checkpoint resume, pending cursor expiry/promotion, skipped-ID retries, stable late-arrival UIDs, immediate partial mailbox access, nonblocking SELECT/NOOP during sync/FETCH/SEARCH/mutations, stale-read protection, body single-flight, 403 retries, bounded CLI concurrency, one 401 recovery probe, and clipboard-only password display. Runtime tuning tests cover shared cooldowns, cancellation without quota debt, retry exhaustion and zero retries, per-attempt deadlines, unchanged-index/cursor persistence, independent refresh schedules, checkpoint timing, and complete LaunchAgent argument preservation.
+Tests use synthetic messages, a simulated CLI, a mock Keychain, and temporary local TLS/HTTP listeners. They do not require `gws`, access real Keychain secrets, authenticate to Google, send real email, change certificate trust, or load a real LaunchAgent. In addition to protocol/MIME/OAuth coverage, they exercise a real SIGKILL and checkpoint resume, pending cursor expiry/promotion, skipped-ID retries, stable late-arrival UIDs, immediate partial mailbox access, nonblocking SELECT/NOOP during sync/FETCH/SEARCH/mutations, stale-read protection, body single-flight, 403 retries, bounded CLI concurrency, one 401 recovery probe, and clipboard-only password display. Runtime tuning tests cover shared cooldowns, cancellation without quota debt, retry exhaustion and zero retries, per-attempt deadlines, unchanged-index/cursor persistence, independent refresh schedules, checkpoint timing, and complete LaunchAgent argument preservation. Logging/service tests cover size rotation, compression, count/age retention, private file permissions, exclusive writers, concurrent records, log following across rotation, fake launchctl lifecycle/failures, and an actual foreground child with stdout/stderr discarded and SIGTERM shutdown.
 
 Reproduce the synthetic throughput and 16,650-message index/persistence checks (no real account):
 
@@ -263,7 +306,7 @@ The reported HTTP 400 succeeded on retry. Its original reason/status and failing
 
 `probe` uses only profile, message-list, and metadata-get requests. Its indices use lexically sorted IDs to reproduce the old sync order. It does not open the cache or fetch raw MIME, and reports read rate separately from listing time. Probe timing includes subprocess overhead and retries; repeated runs can differ with network/cache conditions.
 
-For a full live recovery check, stop any existing bridge first, run `serve`, verify TLS/login and progress, terminate that test process mid-backfill, then restart and inspect the resumed fetched count and stable UIDs. Do not delete or move the existing data directory to create a fresh run without its owner's approval. This task's unavailable remote Mac prevented that live check; all writes remain tested with fake Gmail only.
+For a full live recovery check, stop any existing bridge first, run `serve --foreground`, verify TLS/login and progress, terminate that test process mid-backfill, then restart and inspect the resumed fetched count and stable UIDs. Do not delete or move the existing data directory to create a fresh run without its owner's approval. Live account behavior remains unvalidated here; all writes are tested with fake Gmail only.
 
 For the first live setup, verify:
 
@@ -274,14 +317,17 @@ For the first live setup, verify:
 5. A deliberate test email to yourself, with a second address in Bcc, arrives correctly. Confirm one server-side Sent copy and correct reply threading.
 6. Drafts save locally, and Mail does not try to APPEND to the bridge's Sent folder.
 
-For background use, after login and certificate trust:
+After login and certificate trust, background use is the default:
 
 ```sh
-./bin/mailme install-agent --read-concurrency 6 --quota-profile current
+./bin/mailme serve --read-concurrency 6 --quota-profile current
+./bin/mailme logs --follow
 ./bin/mailme uninstall-agent
 ```
 
-`install-agent` writes `~/Library/LaunchAgents/com.mailme.bridge.plist` with the current executable and data directory's absolute paths, creates `~/Library/Logs/mailme/bridge.log`, and runs `launchctl bootstrap gui/$UID`. It unloads an existing service with that label before loading the new definition. `uninstall-agent` unloads the service and removes only its plist; mail data and credentials remain. Run these as your logged-in user, without `sudo`. Install from the binary location you intend to keep. The tests only render/parse the plist; they never install or load a service.
+`serve`/`start` write `~/Library/LaunchAgents/com.mailme.bridge.plist` with the current executable, data directory, absolute log path, and all runtime/log settings, then run `launchctl bootstrap gui/$UID`. The child uses `serve --foreground` so it does not install itself recursively. `install-agent` forces a reload. `uninstall-agent` unloads the service and removes only its plist; mail data, logs, and credentials remain. Run these as your logged-in user, without `sudo`. Tests use a fake launchctl runner; they never install or load a real service.
+
+To upgrade an older service, rebuild the binary at its installed location and run `install-agent` once with the settings you want to retain. This replaces append-only stdout/stderr redirection with application-managed rotation and adds the explicit foreground child argument. Existing jobs identified by launchd's service name also run in-process when using the new binary.
 
 `contrib/com.mailme.bridge.plist.example` remains available for manual setup. For `gws`, login saves the native executable path, and startup also resolves older saved npm shims. A moved nvm/CLI installation requires rerunning `login --backend gws --gws-path ...`. The installer does not copy shell environment variables or credentials into the plist. If your CLI uses a custom config directory or other authentication environment, configure the necessary `EnvironmentVariables` manually; an interactive shell's environment is not inherited by launchd. Reinstalling replaces the plist, including manual edits.
 
