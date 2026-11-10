@@ -46,7 +46,7 @@ func (r *Runtime) Flags(f *flag.FlagSet) {
 	f.DurationVar(&r.SkippedRetryInterval, "skipped-retry-interval", r.SkippedRetryInterval, "Retry interval for skipped metadata IDs (minimum 1s)")
 	f.DurationVar(&r.CheckpointInterval, "checkpoint-interval", r.CheckpointInterval, "Publish/checkpoint metadata at least this often during backfill (minimum 1s)")
 	f.IntVar(&r.CheckpointBatchSize, "checkpoint-batch-size", r.CheckpointBatchSize, "Metadata results per durable checkpoint (1–500)")
-	f.IntVar(&r.ReadConcurrency, "read-concurrency", r.ReadConcurrency, "Concurrent metadata reads / gws read subprocesses (1–16)")
+	f.IntVar(&r.ReadConcurrency, "read-concurrency", r.ReadConcurrency, "History/backfill metadata workers / gws read subprocesses (1–16)")
 	f.StringVar(&r.QuotaProfile, "quota-profile", r.QuotaProfile, "Gmail quota profile: current or legacy (only if verified)")
 	f.IntVar(&r.Request.QuotaUnitsPerSecond, "quota-units-per-second", r.Request.QuotaUnitsPerSecond, "Shared quota budget (0 uses profile default: current 80, legacy 125)")
 	f.IntVar(&r.Request.ReadRetries, "read-retries", r.Request.ReadRetries, "Retries per read after transient API errors (0–10; writes never retry)")

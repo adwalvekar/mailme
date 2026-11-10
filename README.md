@@ -154,8 +154,8 @@ All tuning flags are accepted by `serve` and `install-agent`; the installer writ
 | --- | --- | --- |
 | `--sync-interval` | `5s` | History polling cadence; minimum `1s` |
 | `--label-interval` | `5m` | Folder creation, rename, and removal checks; minimum `1s` |
-| `--skipped-retry-interval` | `5m` | Retry skipped metadata independently of fast history polling; minimum `1s` |
-| `--read-concurrency` | `6` | Metadata workers / gws read subprocesses; `1`–`16` |
+| `--skipped-retry-interval` | `5m` | Background skipped-pass interval, including the wait before the first pass after startup; minimum `1s` |
+| `--read-concurrency` | `6` | History/backfill metadata workers / gws read subprocesses; `1`–`16` |
 | `--checkpoint-batch-size` | `250` | Results per durable metadata batch; `1`–`500` |
 | `--checkpoint-interval` | `5s` | Flush partial metadata batches during backfill; minimum `1s` |
 | `--quota-profile` | `current` | Method costs and automatic budget; `legacy` requires verified eligibility |
@@ -172,13 +172,19 @@ All tuning flags are accepted by `serve` and `install-agent`; the installer writ
   --quota-units-per-second 80 --read-concurrency 6
 ```
 
-Idle polling only requests history; unchanged labels do not rebuild the mailbox index. A changed history cursor is persisted separately from the index, and an unchanged cursor needs no disk write. Label refresh and skipped-message retries run on their own schedules. Messages mentioned in new history are always fetched immediately, including previously skipped IDs. These changes reduce local indexing and API overhead at short polling intervals. Polls run serially, measuring cadence from the start of each attempt; a slow attempt gets at least one second of rest before the next attempt rather than overlapping polls.
+Idle polling only requests history; unchanged labels do not rebuild the mailbox index. A changed history cursor is persisted separately from the index, and an unchanged cursor needs no disk write. Labels are checked on their configured interval. History polls run serially, measuring cadence from the start of each attempt; a slow attempt gets at least one second of rest before the next attempt rather than overlapping history polls.
+
+Skipped metadata retries run in a separate background loop. The first pass waits the full `--skipped-retry-interval` after startup, and subsequent successful passes wait that interval after completion. Restarting with `--skipped-retry-interval 6h` therefore does not force an immediate skipped pass. Passes pause while a full snapshot is pending and never advance the history cursor. A single repair reader limits outstanding retry work; for gws it shares the existing subprocess pool. All backends still share the same quota pacing and account-wide cooldowns, so normal API latency and quota waits apply.
+
+History polling and fetching messages mentioned in history continue while a skipped pass is in progress. History does not append the skipped set to its own fetch batch or wait for the whole repair pass. If both paths encounter the same ID, history takes precedence: stale repair results cannot overwrite newer history reads or local mutations. Progress logs identify `phase=history`, `phase=snapshot`, or `phase=skipped_retry` so a slow repair pass can be distinguished from a delayed history poll.
 
 Every request, including foreground body downloads and writes, shares the configured quota budget. A rate-limit response pauses the shared account queue, including requests already waiting. Queued requests remain paced when the cooldown ends, and canceled waiters do not consume future quota. Exponential retries add jitter; a server's `Retry-After` remains a minimum even when longer than `--retry-max-delay`. Faster polling does not raise the configured API budget. Lower it if other applications share the same account/project; increasing it requires sufficient available quota.
 
 The first profile history ID is saved as a **pending cursor before listing**. INBOX IDs are ordered first, then the remainder of the mailbox is backfilled. The first small batch becomes visible promptly; subsequent checkpoints occur every 250 messages or five seconds by default (both configurable). A restart validates the pending cursor and resumes unfinished IDs, preserving published UIDs/UIDVALIDITY. A hard kill can require refetching the current uncommitted batch, not the completed batches. Only a finished snapshot promotes the pending cursor to the normal history checkpoint. Subsequent history sync catches changes made during and between attempts. If the pending history has expired, a new full snapshot starts while cached mail remains visible.
 
-Metadata reads with HTTP 400 `invalidArgument`/`failedPrecondition`, HTTP 404, or malformed message responses are recorded and retried on the skipped-message schedule, or sooner when new history mentions them. A 404 also removes a previously cached message. Unclassified HTTP 400s, authorization/permission errors, CLI execution failures, and cancellations stop the attempt without discarding committed batches. Background retries use the configured exponential backoff with jitter. This matters for an intermittent 400 that succeeds on a later attempt: it no longer forces a complete restart.
+Metadata reads with HTTP 400 `invalidArgument`/`failedPrecondition` or malformed message responses remain in the skipped set and are retried on the background schedule, or sooner when new history mentions them. A message-get HTTP 404 (`notFound`) is terminal: the next committed batch removes that ID from the skipped set, cached metadata, folder memberships, and cached body. It is not scheduled for another skipped retry. Old data directories need no reset or migration: IDs left skipped after 404s by v0.0.1 are removed on their first scheduled retry pass after upgrading, once each read confirms the 404.
+
+Unclassified HTTP 400s, authorization/permission errors, CLI execution failures, and cancellations stop the affected attempt without discarding committed batches. A failed repair pass preserves completed removals/recoveries and backs off independently while history polling continues. Background retries use the configured exponential backoff with jitter. Pending snapshot checkpoints still mark completed 404 reads as done, so crash resume does not refetch them or promote an unfinished history cursor. This matters for an intermittent 400 that succeeds on a later attempt: it still does not force a complete restart.
 
 ### Large-mailbox timing
 
@@ -285,7 +291,7 @@ If Google blocks authorization, use the organization's app approval process. If 
 - No offline write queue. Cached mail remains usable during sync failures; uncached bodies and writes require Google access. Fresh caches may initially show empty or partial folders.
 - A simple in-memory metadata index is persisted transactionally. Each checkpoint rewrites that index; very large mailboxes can still spend time in local commits. Long commands no longer block other sessions on network I/O, but each IMAP connection processes its own command stream in order.
 - Gmail changes appear on the polling interval, plus API processing time. No Cloud Pub/Sub setup is required.
-- The `gws` backend still starts one subprocess per request. New arrivals outside the initial listing are caught by history sync after backfill finishes. Persistently skipped IDs are retried on a separate configurable schedule; a large skipped set can still extend that attempt.
+- The `gws` backend still starts one subprocess per request. New arrivals outside the initial listing are caught by history sync after backfill finishes. A large transient skipped set can extend its independent repair pass; history polling continues during that pass, subject to the same shared quota/cooldown and API pool limits.
 - The IMAP dependency is pinned to a v2 beta. Automated protocol coverage does not establish full Apple Mail compatibility; finish the manual checklist below before relying on this for daily work.
 
 ## Validation
