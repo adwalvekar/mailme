@@ -22,6 +22,9 @@ func (b *Bridge) update(fn func(*state)) error {
 func (b *Bridge) Sync(ctx context.Context) error {
 	b.syncMu.Lock()
 	defer b.syncMu.Unlock()
+	if err := b.ctx.Err(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(b.ctx, cancel)
 	defer func() { stop(); cancel() }()
@@ -49,20 +52,9 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	if pending == nil && history != "" {
 		ids, cursor, err := b.api.Changes(ctx, history)
 		if err == nil {
-			retrySkipped := !time.Now().Before(b.nextSkipped)
-			slog.Debug("Gmail history checked", "changed_messages", len(ids), "retry_skipped", retrySkipped)
-			b.mu.Lock()
-			if retrySkipped {
-				for id := range b.state.Skipped {
-					ids = append(ids, id)
-				}
-			}
-			b.mu.Unlock()
-			if err = b.fetchMetadata(ctx, unique(ids), false); err != nil {
+			slog.Debug("Gmail history checked", "changed_messages", len(ids))
+			if err = b.fetchMetadata(ctx, unique(ids), metadataHistory); err != nil {
 				return err
-			}
-			if retrySkipped {
-				b.nextSkipped = time.Now().Add(b.skippedInterval)
 			}
 			if cursor == "" {
 				return fmt.Errorf("Gmail history response has no checkpoint")
@@ -116,12 +108,14 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	pending = b.state.Pending
 	var todo []string
 	for _, id := range pending.IDs {
-		if !pending.Done[id] || b.state.Skipped[id] != "" {
+		// A checkpointed per-message failure is completed snapshot work too.
+		// Retry it independently after promotion, never as a restart prerequisite.
+		if !pending.Done[id] {
 			todo = append(todo, id)
 		}
 	}
 	b.mu.Unlock()
-	if err := b.fetchMetadata(ctx, todo, true); err != nil {
+	if err := b.fetchMetadata(ctx, todo, metadataSnapshot); err != nil {
 		return err
 	}
 	// Do not garbage collect absent messages before listing+backfill finish. A
@@ -217,16 +211,43 @@ type metadataResult struct {
 	err     error
 }
 
-func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) error {
+type metadataKind string
+
+const (
+	metadataSnapshot metadataKind = "snapshot"
+	metadataHistory  metadataKind = "history"
+	metadataSkipped  metadataKind = "skipped_retry"
+)
+
+func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, kind metadataKind) error {
 	if len(ids) == 0 {
 		return ctx.Err()
+	}
+	full, retry := kind == metadataSnapshot, kind == metadataSkipped
+	workerCount := b.workers
+	if retry {
+		// Never fill the shared API pool/queue with a backlog of repair reads.
+		workerCount = 1
+	} else {
+		b.mu.Lock()
+		for _, id := range ids {
+			b.metadataBusy[id] = true
+		}
+		b.mu.Unlock()
+		defer func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, id := range ids {
+				delete(b.metadataBusy, id)
+			}
+		}()
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan string)
-	results := make(chan metadataResult, b.workers)
+	results := make(chan metadataResult, workerCount)
 	var workers sync.WaitGroup
-	for n := 0; n < b.workers; n++ {
+	for n := 0; n < workerCount; n++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
@@ -236,7 +257,11 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 				}
 				b.mu.Lock()
 				version := b.versions[id]
+				eligible := !retry || b.state.Pending == nil && b.state.History != "" && b.state.Skipped[id] != "" && !b.metadataBusy[id]
 				b.mu.Unlock()
+				if !eligible {
+					continue
+				}
 				m, err := b.api.Message(ctx, id, "metadata")
 				if err == nil {
 					err = gmail.ValidateMessage(m, id, "metadata")
@@ -279,7 +304,7 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 		if rate > 0 {
 			eta = (time.Duration(float64(total-done)/rate) * time.Second).String()
 		}
-		slog.Info("Gmail sync progress", "fetched", done, "total", total, "rate_messages_per_second", rate, "eta", eta, "skipped", skipped)
+		slog.Info("Gmail sync progress", "phase", kind, "fetched", done, "total", total, "rate_messages_per_second", rate, "eta", eta, "skipped", skipped)
 	}
 	progress()
 	batch := make([]metadataResult, 0, b.batchSize)
@@ -287,20 +312,30 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 		if len(batch) == 0 {
 			return nil
 		}
+		var removed []string
 		err := b.update(func(st *state) {
 			for _, result := range batch {
+				// A repair result must not resurrect an ID cleared by history, race
+				// a new snapshot, or overwrite a newer history/local operation.
+				if retry && (st.Pending != nil || st.History == "" || st.Skipped[result.id] == "" || b.metadataBusy[result.id] || b.versions[result.id] != result.version) {
+					continue
+				}
 				// A network read started before/during a local mutation must never
 				// overwrite that mutation's result after it commits.
 				if b.versions[result.id] == result.version {
 					if result.err == nil {
 						putRecord(st, result.message)
 						delete(st.Skipped, result.id)
+					} else if is404(result.err) {
+						delete(st.Messages, result.id)
+						delete(st.Skipped, result.id)
+						removed = append(removed, result.id)
 					} else {
 						st.Skipped[result.id] = result.err.Error()
-						if is404(result.err) {
-							delete(st.Messages, result.id)
-						}
 					}
+					// Invalidate older skipped reads even if history left the same
+					// transient error in the skipped set.
+					b.versions[result.id]++
 				} else {
 					st.Skipped[result.id] = "metadata refresh deferred after concurrent local operation"
 				}
@@ -309,6 +344,11 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 				}
 			}
 		})
+		if err == nil {
+			for _, id := range removed {
+				slog.Debug("Removed missing Gmail message; will not retry", "id", gmail.SafeIdentifier(id))
+			}
+		}
 		batch = batch[:0]
 		return err
 	}
@@ -344,14 +384,14 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 				}
 				continue
 			}
-			if result.err != nil {
+			if result.err != nil && !is404(result.err) {
 				slog.Warn("Skipping Gmail message; will retry", "id", gmail.SafeIdentifier(result.id), "error", result.err)
 			}
 			batch = append(batch, result)
 			fetched++
 			// Publish a small first batch for quick INBOX access, then checkpoint
 			// at the configured batch/time limits. Cancellation flushes successes too.
-			if failure == nil && (len(batch) >= b.batchSize || fetched == b.workers) {
+			if failure == nil && (len(batch) >= b.batchSize || fetched == workerCount) {
 				if err := flush(); err != nil {
 					failure = err
 					cancel()
@@ -362,6 +402,11 @@ func (b *Bridge) fetchMetadata(ctx context.Context, ids []string, full bool) err
 }
 
 func (b *Bridge) RunSync(ctx context.Context, interval time.Duration) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(b.ctx, cancel)
+	done := make(chan struct{})
+	go func() { defer close(done); b.runSkippedRetries(ctx) }()
+	defer func() { stop(); cancel(); <-done }()
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}

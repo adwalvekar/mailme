@@ -76,7 +76,6 @@ func TestBadMessagesAreRetriedWithoutLosingSnapshot(t *testing.T) {
 	for name, failure := range map[string]error{
 		"invalid argument":    &gmail.APIError{Status: 400, Reasons: []string{"invalidArgument"}},
 		"failed precondition": &gmail.APIError{Status: 400, State: "FAILED_PRECONDITION"},
-		"not found":           &gmail.APIError{Status: 404},
 		"malformed":           &gmail.MalformedMessageError{ID: "m00001"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -95,8 +94,14 @@ func TestBadMessagesAreRetriedWithoutLosingSnapshot(t *testing.T) {
 			if err := b.Sync(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			if len(b.state.Messages) != 2 || len(b.state.Skipped) != 1 {
+				t.Fatal("history poll ran an inline skipped pass")
+			}
+			if err := b.retrySkipped(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			if len(b.state.Messages) != 3 || len(b.state.Skipped) != 0 || b.state.History != "20" {
-				t.Fatal("skipped ID was not retried in an empty history delta")
+				t.Fatal("independent skipped retry lost the ID or changed the history checkpoint")
 			}
 		})
 	}
@@ -176,8 +181,14 @@ func TestSkippedRetriesUseSeparateScheduleAndHistoryBypassesIt(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if gets != 2 { // snapshot and one scheduled retry, not every idle poll
+	if gets != 1 { // snapshot only: history polling never runs repair work
 		t.Fatalf("skipped ID retried on fast polling schedule: gets=%d", gets)
+	}
+	if err := b.retrySkipped(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 2 {
+		t.Fatalf("independent pass did not retry skipped ID: gets=%d", gets)
 	}
 	f.errorGet = nil
 	h.changes = func(context.Context, string) ([]string, string, error) { return []string{"m00000"}, "30", nil }

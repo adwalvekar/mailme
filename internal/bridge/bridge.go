@@ -31,14 +31,15 @@ type Bridge struct {
 	// mu protects immutable state snapshots and commits; never hold it for API I/O.
 	mu                 sync.Mutex
 	syncMu             sync.Mutex
+	retryMu            sync.Mutex // one skipped pass; independent of history/backfill
 	mutations          sync.Mutex // order complete local mutation commands, independently of readers
 	versions           map[string]uint64
+	metadataBusy       map[string]bool // history/backfill IDs take precedence over skipped reads
 	workers            int
 	batchSize          int
 	labelInterval      time.Duration
 	skippedInterval    time.Duration
 	lastLabels         time.Time // syncMu protects refresh scheduling
-	nextSkipped        time.Time
 	checkpointInterval time.Duration
 	retryPolicy        gmail.RequestPolicy
 	rawMu              sync.Mutex
@@ -112,6 +113,7 @@ func Open(dir, email, password string, api API, options ...Options) (*Bridge, er
 	b.retryPolicy = gmail.DefaultRequestPolicy()
 	b.retryPolicy.RetryMinDelay, b.retryPolicy.RetryMaxDelay = o.RetryMinDelay, o.RetryMaxDelay
 	b.versions = make(map[string]uint64)
+	b.metadataBusy = make(map[string]bool)
 	b.rawFlights = make(map[string]*rawFlight)
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	for id, f := range st.Folders {
@@ -134,6 +136,8 @@ func (b *Bridge) Close() error {
 	b.rawWG.Wait()
 	b.syncMu.Lock()
 	defer b.syncMu.Unlock()
+	b.retryMu.Lock()
+	defer b.retryMu.Unlock()
 	b.mutations.Lock()
 	defer b.mutations.Unlock()
 	b.mu.Lock()
