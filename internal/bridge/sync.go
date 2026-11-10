@@ -108,7 +108,9 @@ func (b *Bridge) Sync(ctx context.Context) error {
 	pending = b.state.Pending
 	var todo []string
 	for _, id := range pending.IDs {
-		if !pending.Done[id] || b.state.Skipped[id] != "" {
+		// A checkpointed per-message failure is completed snapshot work too.
+		// Retry it independently after promotion, never as a restart prerequisite.
+		if !pending.Done[id] {
 			todo = append(todo, id)
 		}
 	}

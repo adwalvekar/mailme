@@ -330,6 +330,49 @@ func TestRestartHonorsSkippedIntervalBeforeFirstPass(t *testing.T) {
 	}
 }
 
+func TestSnapshotResumeDoesNotForceCompletedSkippedReads(t *testing.T) {
+	f := largeFake(1)
+	var oldRequests atomic.Int32
+	h := &hookedAPI{API: f, get: func(ctx context.Context, id, format string) (*gmail.Message, error) {
+		if strings.HasPrefix(id, "old-") {
+			oldRequests.Add(1)
+			return nil, &gmail.APIError{Status: 404}
+		}
+		return f.Message(ctx, id, format)
+	}, changes: func(context.Context, string) ([]string, string, error) { return []string{"m00000"}, "20", nil }}
+	dir := t.TempDir()
+	b := openAPI(t, dir, h, Options{})
+	if err := b.update(func(st *state) {
+		// Simulate a crash after the last old-version batch, before promotion.
+		st.Pending = &snapshot{History: "10", Listed: true, Done: map[string]bool{}, Touched: map[string]bool{}}
+		for n := 0; n < 1084; n++ {
+			id := fmt.Sprintf("old-%04d", n)
+			st.Pending.IDs = append(st.Pending.IDs, id)
+			st.Pending.Done[id] = true
+			st.Skipped[id] = "Gmail API returned HTTP 404"
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b = openAPI(t, dir, h, Options{SkippedRetryInterval: 6 * time.Hour})
+	defer b.Close()
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b.state.Pending != nil || b.state.History != "10" || oldRequests.Load() != 0 || len(b.state.Skipped) != 1084 {
+		t.Fatal("resuming a completed snapshot forced a skipped pass or lost pending repair IDs")
+	}
+	if err := b.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b.state.History != "20" || b.state.Messages["m00000"] == nil || oldRequests.Load() != 0 {
+		t.Fatal("history after snapshot resume waited behind checkpointed skipped IDs")
+	}
+}
+
 func TestSkippedResultCannotOverwriteHistory(t *testing.T) {
 	for _, test := range []struct {
 		name                 string
